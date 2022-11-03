@@ -57,9 +57,21 @@ import java.util.stream.Collectors;
  *   "data_version":0}
  * </pre>
  * */
+
+/**
+ * 本地存储 quorum 状态的信息：
+ * clusterId：集群 ID
+ * leaderId：leader 节点 ID
+ * leaderEpoch：leader 节点的纪元
+ * votedId：投票 ID
+ * appliedOffset：日志偏移量
+ * currentVoters：投票者集合
+ * data_version
+ */
 public class FileBasedStateStore implements QuorumStateStore {
     private static final Logger log = LoggerFactory.getLogger(FileBasedStateStore.class);
 
+    /* 状态存储的文件 */
     private final File stateFile;
 
     static final String DATA_VERSION = "data_version";
@@ -107,8 +119,10 @@ public class FileBasedStateStore implements QuorumStateStore {
             return null;
         }
 
+        // 将 quorum 状态文件解析成 QuorumStateData 实例
         QuorumStateData data = readStateFromFile(stateFile);
 
+        // 根据文件中的信息生成一个 ElectionState 实例，可以根据这个实例来判断当前节点处于什么状态
         return new ElectionState(data.leaderEpoch(),
             data.leaderId() == UNKNOWN_LEADER_ID ? OptionalInt.empty() :
                 OptionalInt.of(data.leaderId()),

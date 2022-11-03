@@ -19,6 +19,9 @@ package org.apache.kafka.raft;
 import java.io.Closeable;
 import java.util.Optional;
 
+/**
+ * 所有节点都会有自己的状态，该接口是状态的顶层接口，主要方法是election
+ */
 public interface EpochState extends Closeable {
 
     default Optional<LogOffsetMetadata> highWatermark() {

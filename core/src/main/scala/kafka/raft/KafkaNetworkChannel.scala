@@ -69,6 +69,7 @@ private[raft] class RaftSendThread(
   time,
   isInterruptible
 ) {
+  // 实例化一个请求处理器队列
   private val queue = new ConcurrentLinkedQueue[RequestAndCompletionHandler]()
 
   def generateRequests(): Iterable[RequestAndCompletionHandler] = {
@@ -84,8 +85,11 @@ private[raft] class RaftSendThread(
     buffer
   }
 
+  // 发送请求
   def sendRequest(request: RequestAndCompletionHandler): Unit = {
+    // 将请求信息入队
     queue.add(request)
+    // 然后唤醒 networkClient
     wakeup()
   }
 
@@ -102,9 +106,12 @@ class KafkaNetworkChannel(
 
   type ResponseHandler = AbstractResponse => Unit
 
+  // 相关的 id 计数器
   private val correlationIdCounter = new AtomicInteger(0)
+  // brokerId => kafka 节点
   private val endpoints = mutable.HashMap.empty[Int, Node]
 
+  // 实例化一个 raft 发送请求线程
   private val requestThread = new RaftSendThread(
     name = threadNamePrefix + "-outbound-request-thread",
     networkClient = client,
@@ -144,8 +151,10 @@ class KafkaNetworkChannel(
       completeFuture(response)
     }
 
+    // 根据请求目标的 broker id 获取对应的 broker 节点
     endpoints.get(request.destinationId) match {
       case Some(node) =>
+        // 调用 requestThread 发送请求
         requestThread.sendRequest(RequestAndCompletionHandler(
           request.createdTimeMs,
           destination = node,

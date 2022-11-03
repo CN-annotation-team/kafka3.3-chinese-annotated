@@ -23,9 +23,13 @@ import java.util.Set;
  * Encapsulate election state stored on disk after every state change.
  */
 public class ElectionState {
+    // 纪元
     public final int epoch;
+    // leader 节点 ID
     public final OptionalInt leaderIdOpt;
+    // 投票 ID
     public final OptionalInt votedIdOpt;
+    // 所有投票者 ID
     private final Set<Integer> voters;
 
     ElectionState(int epoch,

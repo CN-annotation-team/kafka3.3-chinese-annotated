@@ -142,6 +142,7 @@ public class RaftConfig {
         this(parseVoterConnections(abstractConfig.getList(QUORUM_VOTERS_CONFIG)),
             abstractConfig.getInt(QUORUM_REQUEST_TIMEOUT_MS_CONFIG),
             abstractConfig.getInt(QUORUM_RETRY_BACKOFF_MS_CONFIG),
+            // 选举超时时间
             abstractConfig.getInt(QUORUM_ELECTION_TIMEOUT_MS_CONFIG),
             abstractConfig.getInt(QUORUM_ELECTION_BACKOFF_MAX_MS_CONFIG),
             abstractConfig.getInt(QUORUM_FETCH_TIMEOUT_MS_CONFIG),

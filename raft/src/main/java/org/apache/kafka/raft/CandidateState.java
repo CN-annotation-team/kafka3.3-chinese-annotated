@@ -68,6 +68,7 @@ public class CandidateState implements EpochState {
         this.backoffTimer = time.timer(0);
         this.log = logContext.logger(CandidateState.class);
 
+        // 遍历所有投票者 ID，生成一个 投票者ID => 投票者对当前节点的投票状态 Map
         for (Integer voterId : voters) {
             voteStates.put(voterId, State.UNRECORDED);
         }
@@ -78,10 +79,12 @@ public class CandidateState implements EpochState {
         return localId;
     }
 
+    /** 计算投票者过半数量是多少，所有投票者 / 2 + 1 */
     public int majoritySize() {
         return voteStates.size() / 2 + 1;
     }
 
+    /** 所有投票者中给当前节点投票的数量 */
     private long numGranted() {
         return voteStates.values().stream().filter(state -> state == State.GRANTED).count();
     }
@@ -106,6 +109,7 @@ public class CandidateState implements EpochState {
      *
      * @return true if at least a majority of nodes have granted the vote
      */
+    /** 过半机制，如果过半了，表示当前节点可以转换成 leader 节点 */
     public boolean isVoteGranted() {
         return numGranted() >= majoritySize();
     }
@@ -127,6 +131,9 @@ public class CandidateState implements EpochState {
      * @return true if the voter had not been previously recorded
      * @throws IllegalArgumentException if the remote node is not a voter or if the vote had already been
      *         rejected by this node
+     */
+    /**
+     * 记录给当前节点投票的投票者信息
      */
     public boolean recordGrantedVote(int remoteNodeId) {
         State state = voteStates.get(remoteNodeId);

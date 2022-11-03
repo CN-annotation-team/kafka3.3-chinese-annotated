@@ -16,8 +16,13 @@
  */
 package org.apache.kafka.raft;
 
+/**
+ * 封装节点的日志偏移量和纪元，该类主要是用于在进行节点选举投票的时候进行比较，该类的主要方法是 {@link #compareTo(OffsetAndEpoch)}
+ */
 public class OffsetAndEpoch implements Comparable<OffsetAndEpoch> {
+    // 日志偏移量
     public final long offset;
+    // 纪元
     public final int epoch;
 
     public OffsetAndEpoch(long offset, int epoch) {
@@ -51,9 +56,18 @@ public class OffsetAndEpoch implements Comparable<OffsetAndEpoch> {
                 ')';
     }
 
+    /**
+     * 用于比较两个节点之间，谁更有资格当 leader 节点
+     * epoch 越大越有资格成为 leader 副本
+     * epoch 相同，日志偏移量越大的越有资格成为 leader 副本
+     * @param o
+     * @return
+     */
     @Override
     public int compareTo(OffsetAndEpoch o) {
+        // 先比较 epoch
         if (epoch == o.epoch)
+            // 再比较分区副本之间的日志偏移量
             return Long.compare(offset, o.offset);
         return Integer.compare(epoch, o.epoch);
     }

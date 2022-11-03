@@ -40,15 +40,18 @@ object Kafka extends Logging {
     // This is a bit of an ugly crutch till we get a chance to rework the entire command line parsing
     optionParser.accepts("version", "Print version information and exit.")
 
+    // 传入的参数是 --help 的情况，打印 help 信息，然后退出
     if (args.length == 0 || args.contains("--help")) {
       CommandLineUtils.printUsageAndDie(optionParser,
         "USAGE: java [options] %s server.properties [--override property=value]*".format(this.getClass.getCanonicalName.split('$').head))
     }
 
+    // 传入的参数是 --version 的情况，答应 version 信息，然后退出
     if (args.contains("--version")) {
       CommandLineUtils.printVersionAndDie()
     }
 
+    // 到这里，表示第一个参数是配置文件路径，将其加载成一个 Properties 实例
     val props = Utils.loadProps(args(0))
 
     if (args.length > 1) {
@@ -62,10 +65,14 @@ object Kafka extends Logging {
     }
     props
   }
-
+  /* 构建 kafka 服务，会选择基于 zookeeper 来运行还是基于 kafka 自带的 kraft 来运行 */
   private def buildServer(props: Properties): Server = {
+    // 这里会根据配置文件的配置和默认配置生成一个 KafkaConfig 实例
     val config = KafkaConfig.fromProps(props, false)
+    // requiresZookeeper 其实就是判断配置文件中是否有配置 process.roles
+    // 如果配置了表示不需要 zookeeper
     if (config.requiresZookeeper) {
+      // 需要zookeeper的情况会实例化一个 KafkaServer 实例
       new KafkaServer(
         config,
         Time.SYSTEM,
@@ -73,6 +80,7 @@ object Kafka extends Logging {
         enableForwarding = false
       )
     } else {
+      // 使用 kraft 的情况会实例化一个 KafkaRaftServer 实例
       new KafkaRaftServer(
         config,
         Time.SYSTEM,
@@ -83,7 +91,9 @@ object Kafka extends Logging {
 
   def main(args: Array[String]): Unit = {
     try {
+      // 会根据参数给定的配置文件 config/kraft/server.properties，将该文件解析成一个 Properties 实例
       val serverProps = getPropsFromArgs(args)
+      // 如果是 kraft 模式启动，会实例化一个 KafkaRaftServer
       val server = buildServer(serverProps)
 
       try {
@@ -106,6 +116,7 @@ object Kafka extends Logging {
         }
       })
 
+      // 启动服务
       try server.startup()
       catch {
         case e: Throwable =>
@@ -114,6 +125,7 @@ object Kafka extends Logging {
           Exit.exit(1)
       }
 
+      // 这里会进行阻塞，等待关闭
       server.awaitShutdown()
     }
     catch {

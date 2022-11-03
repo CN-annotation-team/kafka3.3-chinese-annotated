@@ -30,10 +30,15 @@ import java.util.Set;
  * by observing a bumped epoch), but has yet to cast its vote or become a
  * candidate itself.
  */
+// 掉线状态
 public class UnattachedState implements EpochState {
+    // 当前纪元
     private final int epoch;
+    // 所有投票者
     private final Set<Integer> voters;
+    // 选举超时时间，该时间表示当前节点需要等待多久之后开始投票，每个节点的该事件都不同
     private final long electionTimeoutMs;
+    // 选举定时器
     private final Timer electionTimer;
     private final Optional<LogOffsetMetadata> highWatermark;
     private final Logger log;
@@ -50,10 +55,16 @@ public class UnattachedState implements EpochState {
         this.voters = voters;
         this.highWatermark = highWatermark;
         this.electionTimeoutMs = electionTimeoutMs;
+        /** 这里需要注意一下，选举定时器设置了自己的 deadlineMs 为 当前时间戳 + 选举超时时间，在{@link KafkaRaftClient#pollUnattached(long)}
+         * 方法中会判断当前kafka时间戳是否大于这个选举超时时间来判断是否开始进行 unattached 的逻辑处理 */
         this.electionTimer = time.timer(electionTimeoutMs);
         this.log = logContext.logger(UnattachedState.class);
     }
 
+    /**
+     * 该状态下的节点和集群脱节了，所以他不知道leaderId,也不能直接当作投票者，所以初始选举化状态时，第二三个参数是空
+     * @return
+     */
     @Override
     public ElectionState election() {
         return new ElectionState(

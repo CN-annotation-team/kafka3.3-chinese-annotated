@@ -136,6 +136,7 @@ public class LeaderState<T> implements EpochState {
         return localId;
     }
 
+    // 获取所有未确认 leader 节点的投票者节点 ID
     public Set<Integer> nonAcknowledgingVoters() {
         Set<Integer> nonAcknowledging = new HashSet<>();
         for (ReplicaState state : voterStates.values()) {

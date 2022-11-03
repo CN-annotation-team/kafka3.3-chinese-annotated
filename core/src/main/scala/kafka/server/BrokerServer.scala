@@ -111,31 +111,40 @@ class BrokerServer(
   var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = null
 
   var logDirFailureChannel: LogDirFailureChannel = null
+  // 日志管理器
   var logManager: LogManager = null
 
   var tokenManager: DelegationTokenManager = null
 
   var dynamicConfigHandlers: Map[String, ConfigHandler] = null
 
+  // 副本管理器
   @volatile private[this] var _replicaManager: ReplicaManager = null
 
   var credentialProvider: CredentialProvider = null
   var tokenCache: DelegationTokenCache = null
 
+  // 消费者分组协调器
   @volatile var groupCoordinator: GroupCoordinator = null
 
+  // 事务协调器
   var transactionCoordinator: TransactionCoordinator = null
 
+  // broker 角色和 controller 角色之间的连接，broker 方是客户端，这里其实就是管理一个 tcp 客户端连接 controller
   var clientToControllerChannelManager: BrokerToControllerChannelManager = null
 
   var forwardingManager: ForwardingManager = null
 
+  // partition 修改管理器
   var alterPartitionManager: AlterPartitionManager = null
 
+  // topic 自动创建管理器
   var autoTopicCreationManager: AutoTopicCreationManager = null
 
+  // 线程池
   var kafkaScheduler: KafkaScheduler = null
 
+  // 当前 broker 节点保存的 kraft 相关的元数据信息缓存
   @volatile var metadataCache: KRaftMetadataCache = null
 
   var quotaManagers: QuotaFactory.QuotaManagers = null
@@ -156,6 +165,7 @@ class BrokerServer(
 
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
 
+  // 状态机改变
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
     try {
@@ -178,17 +188,20 @@ class BrokerServer(
   def replicaManager: ReplicaManager = _replicaManager
 
   override def startup(): Unit = {
+    // 从 SHUTDOWN 状态转换成 STARTING 状态
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
     try {
       info("Starting broker")
 
       config.dynamicConfig.initialize(zkClientOpt = None)
 
+      // 初始化 broker 的生命周期管理器
       lifecycleManager = new BrokerLifecycleManager(config,
         time,
         threadNamePrefix)
 
       /* start scheduler */
+      /* 根据配置指定的 background.threads 来创建一个线程池 */
       kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
       kafkaScheduler.startup()
 
@@ -203,6 +216,7 @@ class BrokerServer(
 
       // Create log manager, but don't start it because we need to delay any potential unclean shutdown log recovery
       // until we catch up on the metadata log and have up-to-date topic and broker configs.
+      // 创建日志管理器，但是不会立即启动该日志管理器，需要等待上一次关闭时的日志信息恢复
       logManager = LogManager(config, initialOfflineDirs, metadataCache, kafkaScheduler, time,
         brokerTopicStats, logDirFailureChannel, keepPartitionMetadataFile = true)
 
@@ -214,6 +228,7 @@ class BrokerServer(
       val controllerNodes = RaftConfig.voterConnectionsToNodes(controllerQuorumVotersFuture.get()).asScala
       val controllerNodeProvider = RaftControllerNodeProvider(raftManager, config, controllerNodes)
 
+      // 管理当前 broker 和 集群 Controller 之间的连接
       clientToControllerChannelManager = BrokerToControllerChannelManager(
         controllerNodeProvider,
         time,
@@ -238,10 +253,12 @@ class BrokerServer(
       // Create and start the socket server acceptor threads so that the bound port is known.
       // Delay starting processors until the end of the initialization sequence to ensure
       // that credentials have been loaded before processing authentications.
+      // 创建 socketServer
       socketServer = new SocketServer(config, metrics, time, credentialProvider, apiVersionManager)
 
       clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)
 
+      // partition 更新管理器
       alterPartitionManager = AlterPartitionManager(
         config,
         metadataCache,
@@ -254,6 +271,7 @@ class BrokerServer(
       )
       alterPartitionManager.start()
 
+      // 副本管理器
       this._replicaManager = new ReplicaManager(
         config = config,
         metrics = metrics,
@@ -278,6 +296,7 @@ class BrokerServer(
 
       // Create group coordinator, but don't start it until we've started replica manager.
       // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+      // 消费者组协调器
       groupCoordinator = GroupCoordinator(config, replicaManager, Time.SYSTEM, metrics)
 
       val producerIdManagerSupplier = () => ProducerIdManager.rpc(
@@ -289,10 +308,12 @@ class BrokerServer(
 
       // Create transaction coordinator, but don't start it until we've started replica manager.
       // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+      // 事务协调器
       transactionCoordinator = TransactionCoordinator(config, replicaManager,
         new KafkaScheduler(threads = 1, threadNamePrefix = "transaction-log-manager-"),
         producerIdManagerSupplier, metrics, metadataCache, Time.SYSTEM)
 
+      // 自动创建 topic 管理器
       autoTopicCreationManager = new DefaultAutoTopicCreationManager(
         config, Some(clientToControllerChannelManager), None, None,
         groupCoordinator, transactionCoordinator)
@@ -399,6 +420,7 @@ class BrokerServer(
 
       // Create the request processor objects.
       val raftSupport = RaftSupport(forwardingManager, metadataCache)
+      // broker 角色开放的 apis
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         metadataSupport = raftSupport,
@@ -420,6 +442,7 @@ class BrokerServer(
         tokenManager = tokenManager,
         apiVersionManager = apiVersionManager)
 
+      // 请求处理线程池
       dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
         config.numIoThreads, s"${DataPlaneAcceptor.MetricPrefix}RequestHandlerAvgIdlePercent",

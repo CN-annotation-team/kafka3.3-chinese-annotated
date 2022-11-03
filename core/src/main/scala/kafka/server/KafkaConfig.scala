@@ -1622,6 +1622,7 @@ class KafkaConfig private(doLog: Boolean, val props: java.util.Map[_, _], dynami
   val brokerHeartbeatIntervalMs: Int = getInt(KafkaConfig.BrokerHeartbeatIntervalMsProp)
   val brokerSessionTimeoutMs: Int = getInt(KafkaConfig.BrokerSessionTimeoutMsProp)
 
+  // 是否需要依赖 zookeeper 运行，如果 process.roles 为空表示需要
   def requiresZookeeper: Boolean = processRoles.isEmpty
   def usesSelfManagedQuorum: Boolean = processRoles.nonEmpty
 
@@ -1964,17 +1965,20 @@ class KafkaConfig private(doLog: Boolean, val props: java.util.Map[_, _], dynami
     }
   }
 
+  // CONTROLLER 角色开放端口（也可以叫 监听器），从 listeners 中获取 controller.listener.name 对应的值
   def controllerListeners: Seq[EndPoint] =
     listeners.filter(l => controllerListenerNames.contains(l.listenerName.value()))
 
   def saslMechanismControllerProtocol: String = getString(KafkaConfig.SaslMechanismControllerProtocolProp)
 
+  // 从 listeners 中获取 control.plane.listener.name 对应的值，kraft 下这里没有值
   def controlPlaneListener: Option[EndPoint] = {
     controlPlaneListenerName.map { listenerName =>
       listeners.filter(endpoint => endpoint.listenerName.value() == listenerName.value()).head
     }
   }
 
+  // 从 listeners 中排除 control.plane.listener.name 和 controller.listener.name 的监听器
   def dataPlaneListeners: Seq[EndPoint] = {
     listeners.filterNot { listener =>
       val name = listener.listenerName.value()
