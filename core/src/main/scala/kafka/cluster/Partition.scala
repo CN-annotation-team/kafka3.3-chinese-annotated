@@ -244,6 +244,13 @@ case class CommittedPartitionState(
  * 5) lock is used to prevent the follower replica from being updated while ReplicaAlterDirThread is
  *    executing maybeReplaceCurrentWithFutureReplica() to replace follower replica with the future replica.
  */
+/**
+ * Partition 的功能划分为以下几类：
+ * 1. 获取(或创建) replica
+ * 2. 副本的 leader/follower 角色切换 {@link makeFollower()} {@link makeLeader()}
+ * 3. ISR 集合管理
+ * 4. 调用日志存储功能完成日志写入
+ * 5. 检测 HW 的位置 */
 class Partition(val topicPartition: TopicPartition,
                 val replicaLagTimeMaxMs: Long,
                 interBrokerProtocolVersion: MetadataVersion,
@@ -255,24 +262,33 @@ class Partition(val topicPartition: TopicPartition,
                 logManager: LogManager,
                 alterIsrManager: AlterPartitionManager) extends Logging with KafkaMetricsGroup {
 
+  // 该分区所属的 topic
   def topic: String = topicPartition.topic
+  // 该分区的 id
   def partitionId: Int = topicPartition.partition
 
   private val stateChangeLogger = new StateChangeLogger(localBrokerId, inControllerContext = false, None)
+  // 远程副本集合
   private val remoteReplicasMap = new Pool[Int, Replica]
   // The read lock is only required when multiple reads are executed and needs to be in a consistent manner
+  // 使用读写所来保证 isr 的读写线程安全
   private val leaderIsrUpdateLock = new ReentrantReadWriteLock
 
   // lock to prevent the follower replica log update while checking if the log dir could be replaced with future log.
   private val futureLogLock = new Object()
   // The current epoch for the partition for KRaft controllers. The current ZK version for the legacy controllers.
+  // partition 的当前纪元
   @volatile private var partitionEpoch: Int = LeaderAndIsr.InitialPartitionEpoch
+  // leader 副本的纪元
   @volatile private var leaderEpoch: Int = LeaderAndIsr.InitialLeaderEpoch - 1
   // start offset for 'leaderEpoch' above (leader epoch of the current leader for this partition),
   // defined when this broker is leader for partition
+  // 当前 leader 副本纪元的开始偏移量
   @volatile private[cluster] var leaderEpochStartOffsetOpt: Option[Long] = None
   // Replica ID of the leader, defined when this broker is leader or follower for the partition.
+  // 该分区的 leader 副本的 id
   @volatile var leaderReplicaIdOpt: Option[Int] = None
+  // 分区状态，记录 ISR 的状态
   @volatile private[cluster] var partitionState: PartitionState = CommittedPartitionState(Set.empty, LeaderRecoveryState.RECOVERED)
   @volatile var assignmentState: AssignmentState = SimpleAssignmentState(Seq.empty)
 
@@ -282,6 +298,7 @@ class Partition(val topicPartition: TopicPartition,
   // log and futureLog variables defined below are used to capture this
   @volatile var log: Option[UnifiedLog] = None
   // If ReplicaAlterLogDir command is in progress, this is future location of the log
+  // 如果调用了修改副本日志目录的命令，该属性保存修改后的日志
   @volatile var futureLog: Option[UnifiedLog] = None
 
   /* Epoch of the controller that last changed the leader. This needs to be initialized correctly upon broker startup.
@@ -325,12 +342,16 @@ class Partition(val topicPartition: TopicPartition,
     * @param highWatermarkCheckpoints Checkpoint to load initial high watermark from
     * @return true iff the future replica is created
     */
+  /** 该方法假定当前副本已经创建，在下面两种情况下创建 future replica
+   * 1. 当前副本不在所给的日志目录下
+   * 2. future replica 不存在（根据 future log 是否存在来判断 future replica 是否存在）*/
   def maybeCreateFutureReplica(logDir: String, highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
     // The writeLock is needed to make sure that while the caller checks the log directory of the
     // current replica and the existence of the future replica, no other thread can update the log directory of the
     // current replica or remove the future replica.
     inWriteLock(leaderIsrUpdateLock) {
       val currentLogDir = localLogOrException.parentDir
+      // 如果当前 logDir 和所给的 logDir 相同，不做处理
       if (currentLogDir == logDir) {
         info(s"Current log directory $currentLogDir is same as requested log dir $logDir. " +
           s"Skipping future replica creation.")
@@ -343,6 +364,7 @@ class Partition(val topicPartition: TopicPartition,
               throw new IllegalStateException(s"The future log dir $futureLogDir of $topicPartition is " +
                 s"different from the requested log dir $logDir")
             false
+          // 如果 futureLog 不存在，创建 futureLog
           case None =>
             createLogIfNotExists(isNew = false, isFutureReplica = true, highWatermarkCheckpoints, topicId)
             true
@@ -351,6 +373,7 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
+  /** 如果日志不存在，创建日志 */
   def createLogIfNotExists(isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints, topicId: Option[Uuid]): Unit = {
     def maybeCreate(logOpt: Option[UnifiedLog]): UnifiedLog = {
       logOpt match {
@@ -360,13 +383,16 @@ class Partition(val topicPartition: TopicPartition,
             topicId.foreach(log.assignTopicId)
           log
         case None =>
+          // 创建日志
           createLog(isNew, isFutureReplica, offsetCheckpoints, topicId)
       }
     }
 
     if (isFutureReplica) {
+      // 创建 futureLog
       this.futureLog = Some(maybeCreate(this.futureLog))
     } else {
+      // 创建 log
       this.log = Some(maybeCreate(this.log))
     }
   }
@@ -378,22 +404,28 @@ class Partition(val topicPartition: TopicPartition,
         info(s"No checkpointed highwatermark is found for partition $topicPartition")
         0L
       }
+      // 日志更新 HW
       val initialHighWatermark = log.updateHighWatermark(checkpointHighWatermark)
       info(s"Log loaded for partition $topicPartition with initial high watermark $initialHighWatermark")
     }
 
+    // 标识正在初始化日志
     logManager.initializingLog(topicPartition)
     var maybeLog: Option[UnifiedLog] = None
     try {
+      // 调用日志管理器获取或创建日志
       val log = logManager.getOrCreateLog(topicPartition, isNew, isFutureReplica, topicId)
       maybeLog = Some(log)
+      // 更新 HW
       updateHighWatermark(log)
       log
     } finally {
+      // 标识日志初始化完成
       logManager.finishedInitializingLog(topicPartition, maybeLog)
     }
   }
 
+  /** 根据副本 ID 获取对应副本 */
   def getReplica(replicaId: Int): Option[Replica] = Option(remoteReplicasMap.get(replicaId))
 
   private def checkCurrentLeaderEpoch(remoteLeaderEpochOpt: Optional[Integer]): Errors = {
@@ -536,6 +568,8 @@ class Partition(val topicPartition: TopicPartition,
    * Delete the partition. Note that deleting the partition does not delete the underlying logs.
    * The logs are deleted by the ReplicaManager after having deleted the partition.
    */
+  /** 删除分区
+   * 注意：删除分区不会立即删除它的日志，日志会被 ReplicaManager 删除*/
   def delete(): Unit = {
     // need to hold the lock to prevent appendMessagesToLeader() from hitting I/O exceptions due to log being deleted
     inWriteLock(leaderIsrUpdateLock) {
@@ -1153,20 +1187,26 @@ class Partition(val topicPartition: TopicPartition,
                             requestLocal: RequestLocal): LogAppendInfo = {
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock) {
       leaderLogIfLocal match {
+        // 只有 leader 副本支持追加消息的操作
         case Some(leaderLog) =>
+          // 获取 minInSyncReplicas 参数（min.insync.replicas）默认为 1
           val minIsr = leaderLog.config.minInSyncReplicas
+          // 获取 ISR 列表的副本数量
           val inSyncSize = partitionState.isr.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
+          // 如果 ISR 列表中副本个数小于最小的 ISR 副本数，并且 acks 为 -1，直接抛出异常
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException(s"The size of the current ISR ${partitionState.isr} " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
           }
 
+          // 往 leader 副本的 log 对象中追加消息，其实就是调用 log 的 append 函数
           val info = leaderLog.appendAsLeader(records, leaderEpoch = this.leaderEpoch, origin,
             interBrokerProtocolVersion, requestLocal)
 
           // we may need to increment high watermark since ISR could be down to 1
+          // 需要后移 leader 副本的 HW 值
           (info, maybeIncrementLeaderHW(leaderLog))
 
         case None =>

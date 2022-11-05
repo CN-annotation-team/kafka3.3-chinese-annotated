@@ -127,16 +127,19 @@ class KafkaApis(val requestChannel: RequestChannel,
     metadataSupport.forwardingManager.isDefined && request.context.principalSerde.isPresent
   }
 
+  // 尝试将请求重定向到 controller 节点进行处理
   private def maybeForwardToController(
     request: RequestChannel.Request,
     handler: RequestChannel.Request => Unit
   ): Unit = {
+    // 定义 controller 节点处理完成之后返回的响应处理回调函数
     def responseCallback(responseOpt: Option[AbstractResponse]): Unit = {
       responseOpt match {
         case Some(response) => requestHelper.sendForwardedResponse(request, response)
         case None => handleInvalidVersionsDuringForwarding(request)
       }
     }
+    // metadataSupport 会根据不同的模式做处理，分别是 raftSupport 和 zkSupport
     metadataSupport.maybeForward(request, handler, responseCallback)
   }
 
@@ -160,6 +163,8 @@ class KafkaApis(val requestChannel: RequestChannel,
   /**
    * Top-level method that handles all requests and multiplexes to the right api
    */
+  /** broker 提供的 api，部分 api 的处理会执行 maybeForwardToController，这种情况是在 kraft 模式下需要由 leader Controller 节点
+   * 进行处理的请求 */
   override def handle(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     try {
       trace(s"Handling request:${request.requestDesc(true)} from connection ${request.context.connectionId};" +
@@ -172,7 +177,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       request.header.apiKey match {
+        /** 生产者生产数据 */
         case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
+        /**
+         * fetch 请求有两个作用：
+         * 1. 接收 follower 副本拉去数据的请求
+         * 2. consumer 消费数据会向服务端发送 fetch 请求 */
         case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
@@ -191,7 +201,23 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.LIST_GROUPS => handleListGroupsRequest(request)
         case ApiKeys.SASL_HANDSHAKE => handleSaslHandshakeRequest(request)
         case ApiKeys.API_VERSIONS => handleApiVersionsRequest(request)
+        /**
+         * 创建 topic 请求处理，如果是 kraft 模式，该请求会重定向到 controller 节点
+         * (topic 创建最后其实只是修改了元数据，并不会对 kafka 整体的功能结构有什么影响，只有在创建 partition 之后外部才能对这个 topic 加日志记录)
+         * kraft 模式下的创建 topic 的大概流程，
+         * 1. 客户端向 broker 角色发送了一个 CREATE_TOPICS 的请求
+         * 2. broker 将请求重定向给 controller leader 节点进行处理
+         * 3. Controller leader 节点将创建 topic 这个动作给记录到日志中成一条记录
+         *    (需要先了解一个知识点：kraft 模式下每个节点都会有一个整个集群的元数据信息的 topic 分区日志副本，该日志副本里面的日志就记录了集
+         *    群的各种动作，像创建 topic 的动作就会被记录进去)
+         * 4. broker follower 节点定时发送 FETCH 请求去抓取 controller leader 节点的日志数据
+         * 5. broker 在抓取日志后，raftClient 发现有新的日志记录，会触发器 raftClint 持有的监听器的 handleCommit 函数
+         *    (broker 角色会向 raftClient 中注册一个 {@link BrokerMetadataListener} 监听器，这里触发的就是该类的 handleCommit)
+         * 6. 触发 handleCommit 后会根据新的日志记录 topicRecord 生成一个 {@link org.apache.kafka.image.TopicImage}
+         *    (这里的的 TopicImage 类在 metadata 模块的 org.apache.kafka.image 包下，该包下的东西其实就是集群元数据在内存中存在的形式)
+         * */
         case ApiKeys.CREATE_TOPICS => maybeForwardToController(request, handleCreateTopicsRequest)
+        /** 删除 topic */
         case ApiKeys.DELETE_TOPICS => maybeForwardToController(request, handleDeleteTopicsRequest)
         case ApiKeys.DELETE_RECORDS => handleDeleteRecordsRequest(request)
         case ApiKeys.INIT_PRODUCER_ID => handleInitProducerIdRequest(request, requestLocal)
@@ -209,6 +235,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.ALTER_REPLICA_LOG_DIRS => handleAlterReplicaLogDirsRequest(request)
         case ApiKeys.DESCRIBE_LOG_DIRS => handleDescribeLogDirsRequest(request)
         case ApiKeys.SASL_AUTHENTICATE => handleSaslAuthenticateRequest(request)
+        /**
+         * 创建 partition 请求处理，被重定向到 controller 节点
+         *
+         * 创建 partition 的流程和创建 topic 的流程差不多，只是创建 topic 只会修改元数据，而创建 partition 最后
+         * 会通过 {@link BrokerMetadataPublisher} 将创建 partition 的任务交给 {@link ReplicaManager 进行处理}
+         */
         case ApiKeys.CREATE_PARTITIONS => maybeForwardToController(request, handleCreatePartitionsRequest)
         case ApiKeys.CREATE_DELEGATION_TOKEN => maybeForwardToController(request, handleCreateTokenRequest)
         case ApiKeys.RENEW_DELEGATION_TOKEN => maybeForwardToController(request, handleRenewTokenRequest)
@@ -541,7 +573,9 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProduceRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    // 获取生产者发送的请求体信息
     val produceRequest = request.body[ProduceRequest]
+    // 请求的字节数
     val requestSize = request.sizeInBytes
 
     if (RequestUtils.hasTransactionalRecords(produceRequest)) {
@@ -553,27 +587,37 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 未授权 topic 响应
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // topic 不存在的响应
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 非法请求
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 封装有权限请求数据的对象
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
     // cache the result to avoid redundant authorization calls
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
       produceRequest.data().topicData().asScala)(_.name())
 
     produceRequest.data.topicData.forEach(topic => topic.partitionData.forEach { partition =>
+      // 根据请求的 topic partition 信息生成一个 TopicPartition 实例
       val topicPartition = new TopicPartition(topic.name, partition.index)
       // This caller assumes the type is MemoryRecords and that is true on current serialization
       // We cast the type to avoid causing big change to code base.
       // https://issues.apache.org/jira/browse/KAFKA-10698
+      // 类型转换，传过来的日志记录是存在内存中，转换成对应的 MemoryRecords
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
-      if (!authorizedTopics.contains(topicPartition.topic))
+      if (!authorizedTopics.contains(topicPartition.topic)) {
+        // topic 未被授权的情况
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
-      else if (!metadataCache.contains(topicPartition))
+      } else if (!metadataCache.contains(topicPartition)) {
+        // 元数据中不存在这个 topic 分区的情况
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
-      else
+      } else
         try {
+          // 验证请求中设置的版本和记录的合法性
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
+          // 到这一步请求中的数据就是合法的了，会将其按 key 为 topicPartition，value 为日志记录 的方式存入 authorizedRequestInfo map 集合中
           authorizedRequestInfo += (topicPartition -> memoryRecords)
         } catch {
           case e: ApiException =>
@@ -650,12 +694,15 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 不存在合法的 partition 数据
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
+      // 存在可以处理的合法的 partition 数据
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // call the replica manager to append messages to the replicas
+      // 调用 replicaManager 副本管理器将日志记录追加到磁盘文件中
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
@@ -663,11 +710,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         origin = AppendOrigin.Client,
         entriesPerPartition = authorizedRequestInfo,
         requestLocal = requestLocal,
+        // 设置发送响应回调函数
         responseCallback = sendResponseCallback,
         recordConversionStatsCallback = processingStatsCallback)
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      // 日志记录已经存储到对应的 partition 中了，可以删除请求中的日志记录了，这样可以及时进行 gc 回收内存
       produceRequest.clearPartitionRecords()
     }
   }
@@ -1893,6 +1942,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     requestHelper.sendResponseMaybeThrottle(request, createResponseCallback)
   }
 
+  // broker 角色这边如果要创建 topic 需要是使用 zookeeper
   def handleCreateTopicsRequest(request: RequestChannel.Request): Unit = {
     val zkSupport = metadataSupport.requireZkOrThrow(KafkaApis.shouldAlwaysForward(request))
     val controllerMutationQuota = quotas.controllerMutation.newQuotaFor(request, strictSinceVersion = 6)

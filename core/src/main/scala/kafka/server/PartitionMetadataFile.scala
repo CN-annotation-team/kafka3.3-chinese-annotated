@@ -34,6 +34,7 @@ object PartitionMetadataFile {
   private val WhiteSpacesPattern = Pattern.compile(":\\s+")
   private val CurrentVersion = 0
 
+  // 在 logDirs 目录下的 <topic>-<partition> 目录下创建一个 partition.metadata 文件
   def newFile(dir: File): File = new File(dir, PartitionMetadataFilename)
 
   object PartitionMetadataFileFormatter {

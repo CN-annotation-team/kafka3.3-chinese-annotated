@@ -432,8 +432,10 @@ class LocalLog(@volatile private var _dir: File,
   }
 
   private[log] def append(lastOffset: Long, largestTimestamp: Long, shallowOffsetOfMaxTimestamp: Long, records: MemoryRecords): Unit = {
+    // 这里就是真实写日志的逻辑了
     segments.activeSegment.append(largestOffset = lastOffset, largestTimestamp = largestTimestamp,
       shallowOffsetOfMaxTimestamp = shallowOffsetOfMaxTimestamp, records = records)
+    // 更新 LEO
     updateLogEndOffset(lastOffset + 1)
   }
 

@@ -138,6 +138,18 @@ import static org.apache.kafka.raft.RaftUtil.hasValidTopicPartition;
  *    as FileRecords, but we use {@link UnalignedRecords} in FetchSnapshotResponse because the records
  *    are not necessarily offset-aligned.
  */
+
+/**
+ * kafka 的 raft 客户端，该类在 RaftManager 中被实例化，说一下几个重要的方法
+ *
+ * {@link #initialize()} 该方法在实例化当前类之后会紧接着被调用，用于初始化当前节点的状态
+ * {@link #poll()} 该方法在 kafka 启动之后会被不停的循环调用，在 RaftManager 中的 RaftIoThread 中被调用，可以认为是当前类的入口方法
+ * {@link #handle(RaftRequest.Inbound)} 该方法是配合 poll() 方法使用，该方法往 {@link #messageQueue} 队列中放入请求，poll 则拿请求进行处理
+ * {@link #pollCurrentState(long)} 该方法是处于各种 quorum 状态下的节点的各种动作的入口类，如果要了解 kraft 模式下的各种角色之间怎么转换和
+ * 各种角色要做什么动作，则可以直接看该方法，被 poll() 方法调用
+ *
+ * @param <T>
+ */
 public class KafkaRaftClient<T> implements RaftClient<T> {
     private static final int RETRY_BACKOFF_BASE_MS = 100;
     public static final int MAX_FETCH_WAIT_MS = 500;
@@ -366,9 +378,12 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
 
     @Override
     public void initialize() {
+        // raft 节点启动的时候会先初始化 quorum 过半机制状态，生成一个初始的选举状态
         quorum.initialize(new OffsetAndEpoch(log.endOffset().offset, log.lastFetchedEpoch()));
 
         long currentTimeMs = time.milliseconds();
+        // 状态判断，在 quorum 初始化后，是不存在 LeaderState 的节点，所以如果是 leader 会报错
+        // 根据相应的状态将节点设置成对应角色
         if (quorum.isLeader()) {
             throw new IllegalStateException("Voter cannot initialize as a Leader");
         } else if (quorum.isCandidate()) {
@@ -378,6 +393,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         }
 
         // When there is only a single voter, become candidate immediately
+        // 该节点自己是投票者，且不存在其他投票者，将其转换成候选人状态
         if (quorum.isVoter()
             && quorum.remoteVoters().isEmpty()
             && !quorum.isCandidate()) {
@@ -452,6 +468,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
     }
 
     private boolean maybeTransitionToLeader(CandidateState state, long currentTimeMs) {
+        // 如果当前候选节点获取到的票数过半，转换成 leader 节点
         if (state.isVoteGranted()) {
             onBecomeLeader(currentTimeMs);
             return true;
@@ -468,12 +485,16 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         }
     }
 
+    // 将当前节点转变成候选者节点
     private void transitionToCandidate(long currentTimeMs) {
+        // 存储候选节点的 ElectionState 实例信息
         quorum.transitionToCandidate();
         maybeFireLeaderChange();
+        // 转变成候选节点的逻辑
         onBecomeCandidate(currentTimeMs);
     }
 
+    // 将节点转变成 Unattached 节点，且纪元设置为给定的 epoch
     private void transitionToUnattached(int epoch) {
         quorum.transitionToUnattached(epoch);
         maybeFireLeaderChange();
@@ -519,11 +540,14 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         onBecomeFollower(currentTimeMs);
     }
 
+    // 构建投票响应
     private VoteResponseData buildVoteResponse(Errors partitionLevelError, boolean voteGranted) {
         return VoteResponse.singletonResponse(
             Errors.NONE,
+            // 指定是哪个 topic 分区
             log.topicPartition(),
             partitionLevelError,
+            // quorum 纪元，如果 voteGranted 为 true，则该 epoch 和发送方的 quorum epoch 相同
             quorum.epoch(),
             quorum.leaderIdOrSentinel(),
             voteGranted);
@@ -540,6 +564,10 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
      *      if this node or the sender is not one of the current known voters)
      * - {@link Errors#INVALID_REQUEST} if the last epoch or offset are invalid
      */
+    /** 处理投票请求，之前已经看过了第一次运行时的状态，各个节点第一次运行时是 Unattached 状态，经过一段随机时间后成为 Candidate 节点
+     * 成为 Candidate 节点之后会发起投票。
+     * 在看该方法前可以认为投票方的随机时间更短，先发起了投票，当前节点处于 Unattached 或 Candidate 状态
+     * 如果 electionTimeoutMs 设置的比较合理，可以认为大部分节点应该是处于 unattached 状态，则当前节点的 quorum 纪元会小于投票方*/
     private VoteResponseData handleVoteRequest(
         RaftRequest.Inbound requestMetadata
     ) {
@@ -557,10 +585,14 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         VoteRequestData.PartitionData partitionRequest =
             request.topics().get(0).partitions().get(0);
 
+        // 从请求中拿到候选人 ID
         int candidateId = partitionRequest.candidateId();
+        // 这里注意一下，构建投票请求的时候，存在两个epoch
+        // candidateEpoch 是发送方的 quorum 的 epoch
         int candidateEpoch = partitionRequest.candidateEpoch();
-
+        // lastEpoch 是副本日志的 epoch
         int lastEpoch = partitionRequest.lastOffsetEpoch();
+        // 获取候选人的日志偏移量
         long lastEpochEndOffset = partitionRequest.lastOffset();
         if (lastEpochEndOffset < 0 || lastEpoch < 0 || lastEpoch >= candidateEpoch) {
             return buildVoteResponse(Errors.INVALID_REQUEST, false);
@@ -571,21 +603,28 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             return buildVoteResponse(errorOpt.get(), false);
         }
 
+        // 如果投票请求中候选人的纪元比当前节点的 quorum 纪元大
         if (candidateEpoch > quorum.epoch()) {
+            // 当前节点转换成 unattached 状态
             transitionToUnattached(candidateEpoch);
         }
 
+        // 封装投票请求中的纪元和日志偏移量
         OffsetAndEpoch lastEpochEndOffsetAndEpoch = new OffsetAndEpoch(lastEpochEndOffset, lastEpoch);
+        // 判断是否可以给当前投票请求的发送者投票，这里会对 epoch 和 日志 offset 进行比较
         boolean voteGranted = quorum.canGrantVote(candidateId, lastEpochEndOffsetAndEpoch.compareTo(endOffset()) >= 0);
 
+        // 如果可以投票，且当前节点是 Unattached 状态，则当前节点转换成已投票状态
         if (voteGranted && quorum.isUnattached()) {
             transitionToVoted(candidateId, candidateEpoch);
         }
 
         logger.info("Vote request {} with epoch {} is {}", request, candidateEpoch, voteGranted ? "granted" : "rejected");
+        // 构建投票响应
         return buildVoteResponse(Errors.NONE, voteGranted);
     }
 
+    // 处理投票响应
     private boolean handleVoteResponse(
         RaftResponse.Inbound responseMetadata,
         long currentTimeMs
@@ -608,20 +647,29 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         OptionalInt responseLeaderId = optionalLeaderId(partitionResponse.leaderId());
         int responseEpoch = partitionResponse.leaderEpoch();
 
+        // 处理响应的错误信息
         Optional<Boolean> handled = maybeHandleCommonResponse(
             error, responseLeaderId, responseEpoch, currentTimeMs);
+        // 判断响应是否存在错误信息
         if (handled.isPresent()) {
             return handled.get();
         } else if (error == Errors.NONE) {
+            // 如果不存在错误
+            // 如果当前节点就是 leader，不需要处理
             if (quorum.isLeader()) {
                 logger.debug("Ignoring vote response {} since we already became leader for epoch {}",
                     partitionResponse, quorum.epoch());
             } else if (quorum.isCandidate()) {
+                // 如果当前节点是候选者
                 CandidateState state = quorum.candidateStateOrThrow();
+                // 判断响应是否同意当前节点发起的投票
                 if (partitionResponse.voteGranted()) {
+                    // 如果同意，记录同意投票者的节点 id
                     state.recordGrantedVote(remoteNodeId);
+                    // 判断当前节点是否可以转换成 leader 节点
                     maybeTransitionToLeader(state, currentTimeMs);
                 } else {
+                    // 不同意投票，记录拒绝投票者的节点 id
                     state.recordRejectedVote(remoteNodeId);
 
                     // If our vote is rejected, we go immediately to the random backoff. This
@@ -1534,6 +1582,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         return false;
     }
 
+    // 处理响应信息
     private void handleResponse(RaftResponse.Inbound response, long currentTimeMs) {
         // The response epoch matches the local epoch, so we can handle the response
         ApiKeys apiKey = ApiKeys.forId(response.data.apiKey());
@@ -1545,6 +1594,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
                 break;
 
             case VOTE:
+                // 处理投票响应
                 handledSuccessfully = handleVoteResponse(response, currentTimeMs);
                 break;
 
@@ -1619,6 +1669,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
                 responseFuture = handleFetchRequest(request, currentTimeMs);
                 break;
 
+            // 候选者会给自己投票，然后把投票请求发送给其他节点，这里就是其他节点处理投票请求的逻辑
             case VOTE:
                 responseFuture = completedFuture(handleVoteRequest(request));
                 break;
@@ -1657,16 +1708,19 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         });
     }
 
+    // 处理入站消息
     private void handleInboundMessage(RaftMessage message, long currentTimeMs) {
         logger.trace("Received inbound message {}", message);
 
         if (message instanceof RaftRequest.Inbound) {
             RaftRequest.Inbound request = (RaftRequest.Inbound) message;
+            // 处理其他节点发送来的请求
             handleRequest(request, currentTimeMs);
         } else if (message instanceof RaftResponse.Inbound) {
             RaftResponse.Inbound response = (RaftResponse.Inbound) message;
             ConnectionState connection = requestManager.getOrCreate(response.sourceId());
             if (connection.isResponseExpected(response.correlationId)) {
+                // 处理其他节点返回的响应信息
                 handleResponse(response, currentTimeMs);
             } else {
                 logger.debug("Ignoring response {} since it is no longer needed", response);
@@ -1764,12 +1818,16 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         );
     }
 
+    // 构建投票请求
     private VoteRequestData buildVoteRequest() {
         OffsetAndEpoch endOffset = endOffset();
+        // 这里需要注意，有两个 epoch，一个 epoch 是当前节点 quorum 的 epoch
+        // 一个 epoch 是当前进行选举的分区的当前副本的 epoch
         return VoteRequest.singletonRequest(
             log.topicPartition(),
             clusterId,
             quorum.epoch(),
+            // 给自己投票
             quorum.localIdOrThrow(),
             endOffset.epoch,
             endOffset.offset
@@ -1921,6 +1979,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         return Math.min(stateTimeoutMs, endQuorumBackoffMs);
     }
 
+    // leader 节点需要处理的逻辑
     private long pollLeader(long currentTimeMs) {
         LeaderState<T> state = quorum.leaderStateOrThrow();
         maybeFireLeaderChange(state);
@@ -1935,6 +1994,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             currentTimeMs
         );
 
+        // 这里会向所有未确认 leader 的投票者节点发送 begin Quorum Epoch 请求，告诉他们 leader 节点已经选出来了
         long timeUntilSend = maybeSendRequests(
             currentTimeMs,
             state.nonAcknowledgingVoters(),
@@ -1944,25 +2004,31 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         return Math.min(timeUntilFlush, timeUntilSend);
     }
 
+    // 候选者发送投票请求
     private long maybeSendVoteRequests(
         CandidateState state,
         long currentTimeMs
     ) {
         // Continue sending Vote requests as long as we still have a chance to win the election
+        // 继续发送投票请求，知道被拒绝的投票请求达到一半
         if (!state.isVoteRejected()) {
             return maybeSendRequests(
                 currentTimeMs,
+                // 对没有返回投票结果的可参与投票的节点发送投票请求
                 state.unrecordedVoters(),
+                // 构建投票请求
                 this::buildVoteRequest
             );
         }
         return Long.MAX_VALUE;
     }
 
+    // 候选者节点的处理逻辑
     private long pollCandidate(long currentTimeMs) {
         CandidateState state = quorum.candidateStateOrThrow();
         GracefulShutdown shutdown = this.shutdown.get();
 
+        // 判断 kafka 是否开始关闭了
         if (shutdown != null) {
             // If we happen to shutdown while we are a candidate, we will continue
             // with the current election until one of the following conditions is met:
@@ -1979,12 +2045,16 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             }
             return state.remainingBackoffMs(currentTimeMs);
         } else if (state.hasElectionTimeoutExpired(currentTimeMs)) {
+            // 如果超时了的情况
             long backoffDurationMs = binaryExponentialElectionBackoffMs(state.retries());
             logger.debug("Election has timed out, backing off for {}ms before becoming a candidate again",
                 backoffDurationMs);
+            // 开启 backing off 之后再次循环会 进入 state.isBackingOff 的 if 代码段中
             state.startBackingOff(currentTimeMs, backoffDurationMs);
             return backoffDurationMs;
         } else {
+            // 没超时的情况，kafka 启动之后成为 Candidate 节点会先进入该 if 分支
+            // 尝试发送投票请求
             long minRequestBackoffMs = maybeSendVoteRequests(state, currentTimeMs);
             return Math.min(minRequestBackoffMs, state.remainingElectionTimeMs(currentTimeMs));
         }
@@ -2070,9 +2140,16 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         }
     }
 
+    /**
+     * unattached 状态下的节点的处理方法
+     * @param currentTimeMs
+     * @return
+     */
     private long pollUnattached(long currentTimeMs) {
         UnattachedState state = quorum.unattachedStateOrThrow();
+        // 判断当前节点 id 是不是存在与配置文件的投票配置中
         if (quorum.isVoter()) {
+            // 如果存在的情况
             return pollUnattachedAsVoter(state, currentTimeMs);
         } else {
             return pollUnattachedAsObserver(state, currentTimeMs);
@@ -2086,6 +2163,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             // shutdown completes or an epoch bump forces another state transition
             return shutdown.remainingTimeMs();
         } else if (state.hasElectionTimeoutExpired(currentTimeMs)) {
+            // 如果当前时间超过了选举定时器设置的期限时间，执行当前节点转变成候选者节点的逻辑
             transitionToCandidate(currentTimeMs);
             return 0L;
         } else {
@@ -2098,18 +2176,31 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         return Math.min(fetchBackoffMs, state.remainingElectionTimeMs(currentTimeMs));
     }
 
+    /**
+     * 该方法是 kraft 运作的入口方法，kafka 运行起来后 raft IO 线程会一直调用该方法
+     * 根据不同的 quorum 状态来做不同的处理，这里需要分不同的状态代入进去来分析，具体判断当前节点是什么状态需要
+     * 看{@link QuorumState#initialize(OffsetAndEpoch)}
+     * 1. 先分析 kafka 节点第一次运行的情况，当前 kafka 节点是刚被安装好然后运行，第一次运行当前节点是处于 Unattached 状态，
+     *    如果当前节点在配置文件的 controller.quorum.voters 被设置，则该节点会转换成 Candidate 节点，Candidate 节点会
+     *    发送投票请求，然后如果投票通过过半了，则可以变成 leader 节点
+     */
     private long pollCurrentState(long currentTimeMs) {
         if (quorum.isLeader()) {
+            // 处于 leader 状态下，会发送 BeginQuorumEpoch 请求
             return pollLeader(currentTimeMs);
         } else if (quorum.isCandidate()) {
+            // 处于 Candidate 状态下，会发送投票请求，并试图将自己转换成 leader 节点
             return pollCandidate(currentTimeMs);
         } else if (quorum.isFollower()) {
+            // follower 角色的处理逻辑
             return pollFollower(currentTimeMs);
         } else if (quorum.isVoted()) {
             return pollVoted(currentTimeMs);
         } else if (quorum.isUnattached()) {
+            // 处于 unattached 状态下的情况，在这个状态下，如果是在投票者列表中则会转换成 Candidate 状态
             return pollUnattached(currentTimeMs);
         } else if (quorum.isResigned()) {
+            // 处于 resigned 状态下的情况，会先发送 endQuorumEpoch 请求，然后转变成 Candidate 状态
             return pollResigned(currentTimeMs);
         } else {
             throw new IllegalStateException("Unexpected quorum state " + quorum);
@@ -2215,6 +2306,8 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
      *
      * @param request The inbound request
      */
+    /** 并没有做实际的处理，只会将 request 请求方法 messageQueue 队列中，具体处理请求的方法是 {@link #poll()}
+     * 这里的 request 的实际来处是 {@link ControllerApis}，ControllerApis 接收到 raft 相关请求会将其交给当前类进行处理 */
     public void handle(RaftRequest.Inbound request) {
         messageQueue.add(Objects.requireNonNull(request));
     }
@@ -2223,7 +2316,11 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
      * Poll for new events. This allows the client to handle inbound
      * requests and send any needed outbound requests.
      */
+    /**
+     * 该方法由 {@link kafka.raft.KafkaRaftManager.RaftIoThread 调用}
+     */
     public void poll() {
+        /** 处理通过 {@link #register(Listener)} 注册进来的监听器 */
         pollListeners();
 
         long currentTimeMs = time.milliseconds();
@@ -2231,6 +2328,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             return;
         }
 
+        /** 处理当前的 EpochState */
         long pollStateTimeoutMs = pollCurrentState(currentTimeMs);
         long cleaningTimeoutMs = snapshotCleaner.maybeClean(currentTimeMs);
         long pollTimeoutMs = Math.min(pollStateTimeoutMs, cleaningTimeoutMs);
@@ -2242,6 +2340,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
         currentTimeMs = time.milliseconds();
         kafkaRaftMetrics.updatePollEnd(currentTimeMs);
 
+        // 处理 raft 相关的各种请求
         if (message != null) {
             handleInboundMessage(message, currentTimeMs);
         }

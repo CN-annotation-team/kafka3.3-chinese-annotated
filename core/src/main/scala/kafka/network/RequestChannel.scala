@@ -43,6 +43,7 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
+// 定义了 RequestChannel 相关的各种内部类
 object RequestChannel extends Logging {
   private val requestLogger = Logger("kafka.request.logger")
 
@@ -119,6 +120,7 @@ object RequestChannel extends Logging {
       releaseBuffer()
     }
 
+    // 判断当前请求是否重定向请求，判断 envelope 是否存在，只有重定向请求才有该属性
     def isForwarded: Boolean = envelope.isDefined
 
     private def shouldReturnNotController(response: AbstractResponse): Boolean = {
@@ -300,6 +302,7 @@ object RequestChannel extends Logging {
 
   sealed abstract class Response(val request: Request) {
 
+    // processor 指向请求的 processor
     def processor: Int = request.processor
 
     def responseLog: Option[JsonNode] = None
@@ -341,13 +344,17 @@ object RequestChannel extends Logging {
   }
 }
 
+// 请求通道，其实就是持有一个队列，然后将请求进行入队，出队操作，不涉及实际的网络 IO
 class RequestChannel(val queueSize: Int,
                      val metricNamePrefix: String,
                      time: Time,
                      val metrics: RequestChannel.Metrics) extends KafkaMetricsGroup {
   import RequestChannel._
+  // 请求队列，是个阻塞队列
   private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
+  // processor 集合，processor Id => processor
   private val processors = new ConcurrentHashMap[Int, Processor]()
+  // 指标属性
   val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
   val responseQueueSizeMetricName = metricNamePrefix.concat(ResponseQueueSizeMetric)
 
@@ -359,6 +366,7 @@ class RequestChannel(val queueSize: Int,
     }
   })
 
+  // 添加一个 processor 到 processors 集合中
   def addProcessor(processor: Processor): Unit = {
     if (processors.putIfAbsent(processor.id, processor) != null)
       warn(s"Unexpected processor with processorId ${processor.id}")
@@ -367,12 +375,14 @@ class RequestChannel(val queueSize: Int,
       Map(ProcessorMetricTag -> processor.id.toString))
   }
 
+  // 根据 id 移除一个 processor
   def removeProcessor(processorId: Int): Unit = {
     processors.remove(processorId)
     removeMetric(responseQueueSizeMetricName, Map(ProcessorMetricTag -> processorId.toString))
   }
 
   /** Send a request to be handled, potentially blocking until there is room in the queue for the request */
+  /** 发送请求，其实就是将 request 实例入队到 requestQueue 中 */
   def sendRequest(request: RequestChannel.Request): Unit = {
     requestQueue.put(request)
   }
@@ -393,6 +403,7 @@ class RequestChannel(val queueSize: Int,
     onComplete: Option[Send => Unit]
   ): Unit = {
     updateErrorMetrics(request.header.apiKey, response.errorCounts.asScala)
+    // 根据 request 实例化一个 SendResponse 实例
     sendResponse(new RequestChannel.SendResponse(
       request,
       request.buildResponseSend(response),
@@ -414,6 +425,7 @@ class RequestChannel(val queueSize: Int,
   }
 
   /** Send a response back to the socket server to be sent over the network */
+  /** 将 response 入队到其对应的 processor 的响应队列中 */
   private[network] def sendResponse(response: RequestChannel.Response): Unit = {
     if (isTraceEnabled) {
       val requestHeader = response.request.headerForLoggingOrThrottling()
@@ -444,15 +456,18 @@ class RequestChannel(val queueSize: Int,
       case _: StartThrottlingResponse | _: EndThrottlingResponse => ()
     }
 
+    // 获取响应对应的 processor
     val processor = processors.get(response.processor)
     // The processor may be null if it was shutdown. In this case, the connections
     // are closed, so the response is dropped.
     if (processor != null) {
+      // 将响应入队到 processor 的响应队列中
       processor.enqueueResponse(response)
     }
   }
 
   /** Get the next request or block until specified time has elapsed */
+  /** 接收请求，就是从队列中取出一个请求 */
   def receiveRequest(timeout: Long): RequestChannel.BaseRequest =
     requestQueue.poll(timeout, TimeUnit.MILLISECONDS)
 

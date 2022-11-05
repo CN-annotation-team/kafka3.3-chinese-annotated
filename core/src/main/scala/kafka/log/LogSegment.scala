@@ -51,12 +51,18 @@ import scala.math._
  * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
  * @param time The time instance
  */
+/**
+ * LogSegment 是一个逻辑上的概念，一个 LogSegment 对应磁盘上一个日志文件和一个索引文件，日志文件记录消息，索引文件保存消息的索引
+ * 每个日志文件都对应一个索引文件，使用的是稀疏索引方式存储索引，就是每格多少条记录添加一个索引
+ */
 @nonthreadsafe
 class LogSegment private[log] (val log: FileRecords,
                                val lazyOffsetIndex: LazyIndex[OffsetIndex],
                                val lazyTimeIndex: LazyIndex[TimeIndex],
                                val txnIndex: TransactionIndex,
+                              // logSegment 中第一条消息的 offset 值
                                val baseOffset: Long,
+                              // indexIntervalBytes 索引项之间间隔的最小字节数，默认是 4096
                                val indexIntervalBytes: Int,
                                val rollJitterMs: Long,
                                val time: Time) extends Logging {
@@ -65,10 +71,16 @@ class LogSegment private[log] (val log: FileRecords,
 
   def timeIndex: TimeIndex = lazyTimeIndex.get
 
+  // 是否需要新建 LogSegment
   def shouldRoll(rollParams: RollParams): Boolean = {
     val reachedRollMs = timeWaitedForRoll(rollParams.now, rollParams.maxTimestampInMessages) > rollParams.maxSegmentMs - rollJitterMs
+    // 如果一个 segment 大小超过 1G，就需要新建一个 segment
     size > rollParams.maxSegmentBytes - rollParams.messagesSize ||
+    // 距离上次创建 logSegment 的时间达到了一定的阈值，（log.roll.hours） 7天，并且数据文件有数据
       (size > 0 && reachedRollMs) ||
+    // 索引文件满了（默认 10M）log.index.size.max.bytes
+    // 时间索引文件满了（默认 10M）
+    // 最大的 offset，其相对偏移量超过了正整数的阈值
       offsetIndex.isFull || timeIndex.isFull || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages)
   }
 
@@ -144,29 +156,42 @@ class LogSegment private[log] (val log: FileRecords,
   def append(largestOffset: Long,
              largestTimestamp: Long,
              shallowOffsetOfMaxTimestamp: Long,
+            // MemoryRecords 是 kafka 中 消息在内存中的存在形式
              records: MemoryRecords): Unit = {
+    // 判断消息的大小
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
+      // 获取 FileRecord 文件的末尾，他就是本次消息要写入的物理地址
       val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      // 确保输入参数最大位移值是合法的
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      // 调用 FileRecords 的 append 方法添加 records
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
+      // 更新最大的 timestamp 和对应的 offset
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampAndOffsetSoFar = TimestampOffset(largestTimestamp, shallowOffsetOfMaxTimestamp)
       }
       // append an entry to the index (if needed)
+      /** 当已写入字节数超过 4kB 之后，会调用索引对象的 append 方法增加索引项，同时清空已写入字节数
+       * 注意：这里并不是来一条数据就写入一条索引，而是达到一定的条件才写一次索引，这种索引叫稀疏索引
+       * indexIntervalBytes 就是 4096 字节，配置项是 index.interval.bytes */
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
+        // 添加索引到索引文件，这里面使用了 mmap
         offsetIndex.append(largestOffset, physicalPosition)
+        // 时间索引，一般用不到
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
+        // 成功添加索引后，bytesSinceLastIndexEntry 重置为 0
         bytesSinceLastIndexEntry = 0
       }
+      // 这里会记录两次添加索引项之间的字节数，这个值超过 4096 就会加索引，然后重置这个值
       bytesSinceLastIndexEntry += records.sizeInBytes
     }
   }
@@ -664,6 +689,7 @@ class LogSegment private[log] (val log: FileRecords,
 
 object LogSegment {
 
+  // 创建一个 LogSegment 实例
   def open(dir: File, baseOffset: Long, config: LogConfig, time: Time, fileAlreadyExists: Boolean = false,
            initFileSize: Int = 0, preallocate: Boolean = false, fileSuffix: String = ""): LogSegment = {
     val maxIndexSize = config.maxIndexSize

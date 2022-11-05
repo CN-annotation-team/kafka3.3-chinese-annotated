@@ -413,6 +413,7 @@ public class ReplicationControlManager {
             }
             topicNames.add(record.name());
         }
+        // 加入一条 topic 记录
         topics.put(record.topicId(),
             new TopicControlInfo(record.name(), snapshotRegistry, record.topicId()));
         controllerMetrics.setGlobalTopicsCount(topics.size());

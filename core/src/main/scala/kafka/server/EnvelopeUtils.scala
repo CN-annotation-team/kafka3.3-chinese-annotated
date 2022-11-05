@@ -28,7 +28,9 @@ import org.apache.kafka.common.security.auth.KafkaPrincipal
 
 import scala.compat.java8.OptionConverters._
 
+/** 重定向请求工具 */
 object EnvelopeUtils {
+  // 处理重定向请求
   def handleEnvelopeRequest(
     request: RequestChannel.Request,
     requestChannelMetrics: RequestChannel.Metrics,

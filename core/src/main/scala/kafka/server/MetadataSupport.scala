@@ -58,14 +58,18 @@ sealed trait MetadataSupport {
 
   def canForward(): Boolean
 
+  // 判断请求是否可以重定向
   def maybeForward(
     request: RequestChannel.Request,
     handler: RequestChannel.Request => Unit,
     responseCallback: Option[AbstractResponse] => Unit
   ): Unit = {
+    // 判断是否 request 的 envelope 属性是否没有被定义（是否是已经重定向的请求），且是否可以重定向（kraft 模式下可以重定向）
     if (!request.isForwarded && canForward()) {
+      // 调用重定向管理器的 forwardRequest 方法，对请求重定向
       forwardingManager.get.forwardRequest(request, responseCallback)
     } else {
+      // 如果不能重定向就直接调用请求处理逻辑
       handler(request)
     }
   }
@@ -100,5 +104,6 @@ case class RaftSupport(fwdMgr: ForwardingManager, metadataCache: KRaftMetadataCa
     }
   }
 
+  // kraft 模式下，需要重定向
   override def canForward(): Boolean = true
 }

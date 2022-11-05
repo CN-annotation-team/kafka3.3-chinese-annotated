@@ -127,6 +127,7 @@ class BrokerMetadataPublisher(
    */
   val publishedOffsetAtomic = new AtomicLong(-1)
 
+  /** 将 metadata 的各部分分发到对应的功能进行处理，主要看 topic 部分 */
   override def publish(delta: MetadataDelta, newImage: MetadataImage): Unit = {
     val highestOffsetAndEpoch = newImage.highestOffsetAndEpoch()
 
@@ -155,6 +156,7 @@ class BrokerMetadataPublisher(
         debug(s"Publishing metadata at offset $highestOffsetAndEpoch with $metadataVersionLogMsg.")
       }
 
+      // 处理 features
       Option(delta.featuresDelta()).foreach { featuresDelta =>
         featuresDelta.metadataVersionChange().ifPresent{ metadataVersion =>
           info(s"Updating metadata.version to ${metadataVersion.featureLevel()} at offset $highestOffsetAndEpoch.")
@@ -162,9 +164,11 @@ class BrokerMetadataPublisher(
       }
 
       // Apply topic deltas.
+      // 处理 topic 的更改
       Option(delta.topicsDelta()).foreach { topicsDelta =>
         try {
           // Notify the replica manager about changes to topics.
+          /** 让 {@link ReplicaManager} 来处理 topic 的变化，这里会处理 topic partition 的创建删除 */
           replicaManager.applyDelta(topicsDelta, newImage)
         } catch {
           case t: Throwable => metadataPublishingFaultHandler.handleFault("Error applying topics " +
@@ -211,6 +215,7 @@ class BrokerMetadataPublisher(
       }
 
       // Apply configuration deltas.
+      // 处理 configuration 的更改
       Option(delta.configsDelta()).foreach { configsDelta =>
         configsDelta.changes().keySet().forEach { resource =>
           val props = newImage.configs().configProperties(resource)
@@ -266,6 +271,7 @@ class BrokerMetadataPublisher(
 
       try {
         // Apply client quotas delta.
+        // 处理 client quotas 的更改
         Option(delta.clientQuotasDelta()).foreach { clientQuotasDelta =>
           clientQuotaMetadataManager.update(clientQuotasDelta)
         }

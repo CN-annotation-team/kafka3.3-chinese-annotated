@@ -56,6 +56,7 @@ import scala.compat.java8.OptionConverters._
 /**
  * A Kafka controller that runs in KRaft (Kafka Raft) mode.
  */
+/* 在 kraft 下运行的 kafka controller 角色 */
 class ControllerServer(
   val metaProperties: MetaProperties,
   val config: KafkaConfig,
@@ -75,8 +76,11 @@ class ControllerServer(
 
   config.dynamicConfig.initialize(zkClientOpt = None)
 
+  // controller 角色状态更新需要保证线程安全
   val lock = new ReentrantLock()
+  // controller 角色关闭监视器
   val awaitShutdownCond = lock.newCondition()
+  // controller 角色的状态，默认 SHUTDOWN
   var status: ProcessStatus = SHUTDOWN
 
   var linuxIoMetricsCollector: LinuxIoMetricsCollector = null
@@ -89,14 +93,20 @@ class ControllerServer(
   var alterConfigPolicy: Option[AlterConfigPolicy] = None
   var controller: Controller = null
   var quotaManagers: QuotaManagers = null
+  // controller 角色处理 ControllerApis 中的接口
   var controllerApis: ControllerApis = null
+  // 持有一个接口处理线程池
   var controllerApisHandlerPool: KafkaRequestHandlerPool = null
 
+  // 尝试将当前 controller 的状态从 from 状态改为 to 状态，其实就是一个 CAS，不过对于更改之后的状态如果
+  // 是 SHUTDOWN 的情况需要做特定处理
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
     try {
       if (status != from) return false
       status = to
+      // 如果更改后的状态是 SHUTDOWN, 需要给用 awaitShutdownCond 阻塞的地方解阻塞
+      // 其实就是一般运行的时候会调用 startup 方法之后，会调用对应的 awaitShutdown 方法进行阻塞，这里解阻塞就用来退出主线程
       if (to == SHUTDOWN) awaitShutdownCond.signalAll()
     } finally {
       lock.unlock()
@@ -113,7 +123,9 @@ class ControllerServer(
 
   def clusterId: String = metaProperties.clusterId
 
+  // 启动 controller 角色
   def startup(): Unit = {
+    // 状态机转换
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
     try {
       info("Starting controller")
@@ -154,10 +166,12 @@ class ControllerServer(
           }.toMap
       }
 
+      // 生成一个 apiVersionManager,指定了监听类型是 CONTROLLER
       val apiVersionManager = new SimpleApiVersionManager(ListenerType.CONTROLLER)
 
       tokenCache = new DelegationTokenCache(ScramMechanism.mechanismNames)
       credentialProvider = new CredentialProvider(ScramMechanism.mechanismNames, tokenCache)
+      // 实例化 SocketServer
       socketServer = new SocketServer(config,
         metrics,
         time,
@@ -223,6 +237,7 @@ class ControllerServer(
       }
 
       quotaManagers = QuotaFactory.instantiate(config, metrics, time, threadNamePrefix.getOrElse(""))
+      // 实例化 Controller 角色管理的 API
       controllerApis = new ControllerApis(socketServer.dataPlaneRequestChannel,
         authorizer,
         quotaManagers,
@@ -233,8 +248,11 @@ class ControllerServer(
         metaProperties,
         controllerNodes.asScala.toSeq,
         apiVersionManager)
+      // 实例化 handler 线程池，在 SocketServer 中处理各种请求的实际逻辑是交给 handler 处理的
       controllerApisHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
+        // handler 会持有 socketServer 的 dataPlaneRequestChannel，从其中取出请求进行处理
         socketServer.dataPlaneRequestChannel,
+        // handler 需要持有 api 实例来分辨请求类型和处理各种请求
         controllerApis,
         time,
         config.numIoThreads,

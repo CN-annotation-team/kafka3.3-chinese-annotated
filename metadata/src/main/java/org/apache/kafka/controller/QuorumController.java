@@ -751,11 +751,14 @@ public final class QuorumController implements Controller {
                 controllerMetrics.updateEventQueueTime(NANOSECONDS.toMillis(now - eventCreatedTimeNs));
             }
             int controllerEpoch = curClaimEpoch;
+            // 如果当前不是 Controller 节点直接报错
             if (!isActiveController()) {
                 throw newNotControllerException();
             }
             startProcessingTimeNs = OptionalLong.of(now);
+            // 调用 op 生成 ControllerResult
             ControllerResult<T> result = op.generateRecordsAndResult();
+            // 判断记录是否为空
             if (result.records().isEmpty()) {
                 op.processBatchEndOffset(writeOffset);
                 // If the operation did not return any records, then it was actually just
@@ -777,9 +780,11 @@ public final class QuorumController implements Controller {
                         "reaches offset {}", this, resultAndOffset.offset());
                 }
             } else {
+                // 记录不为空的情况
                 // Pass the records to the Raft layer. This will start the process of committing
                 // them to the log.
                 long offset = appendRecords(log, result, maxRecordsPerBatch,
+                    // 这里会处理 ApiMessageAndVersion 了
                     new Function<List<ApiMessageAndVersion>, Long>() {
                         private long prevEndOffset = writeOffset;
 
@@ -791,6 +796,7 @@ public final class QuorumController implements Controller {
                             int i = 1;
                             for (ApiMessageAndVersion message : records) {
                                 try {
+                                    // 添加记录
                                     replay(message.message(), Optional.empty(), prevEndOffset + records.size());
                                 } catch (Throwable e) {
                                     String failureMessage = String.format("Unable to apply %s record, which was " +
@@ -801,6 +807,7 @@ public final class QuorumController implements Controller {
                                 }
                                 i++;
                             }
+                            //
                             prevEndOffset = raftClient.scheduleAtomicAppend(controllerEpoch, records);
                             snapshotRegistry.getOrCreateSnapshot(prevEndOffset);
                             return prevEndOffset;
@@ -912,10 +919,14 @@ public final class QuorumController implements Controller {
         }
     }
 
+    /** 追加一个写事件 */
     <T> CompletableFuture<T> appendWriteEvent(String name,
                                               OptionalLong deadlineNs,
+                                              // ControllerWriteOperation 是个函数式接口
                                               ControllerWriteOperation<T> op) {
         ControllerWriteEvent<T> event = new ControllerWriteEvent<>(name, op);
+        // 使用 queue 追加事件，这里的 queue 是 KafkaEventQueue，这种队列只需要入队就行了，队列内部会对入队的事件进行处理，
+        // 最后会调用 ControllerWriterEvent 的 run 方法，到这里直接去 ControllerWriteEvent 的 run 方法中去看就行了
         if (deadlineNs.isPresent()) {
             queue.appendWithDeadline(deadlineNs.getAsLong(), event);
         } else {
@@ -1792,6 +1803,7 @@ public final class QuorumController implements Controller {
         this.bootstrapMetadata = bootstrapMetadata;
         this.maxRecordsPerBatch = maxRecordsPerBatch;
         this.metaLogListener = new QuorumMetaLogListener();
+        // 初始化 curClaimEpoch = -1
         this.curClaimEpoch = -1;
         this.needToCompleteAuthorizerLoad = authorizer.isPresent();
         updateWriteOffset(-1);
@@ -1815,6 +1827,7 @@ public final class QuorumController implements Controller {
             () -> replicationControl.alterPartition(context, request));
     }
 
+    /** 该方法会被 Controller leader 调用用来处理创建 topics 的逻辑 */
     @Override
     public CompletableFuture<CreateTopicsResponseData> createTopics(
         ControllerRequestContext context,
@@ -1823,7 +1836,11 @@ public final class QuorumController implements Controller {
         if (request.topics().isEmpty()) {
             return CompletableFuture.completedFuture(new CreateTopicsResponseData());
         }
+        // 可以看到 Controller leader 部分追加了一个名为 createTopics 的写事件
         return appendWriteEvent("createTopics", context.deadlineNs(),
+            // 这里会生成一个 ControllerResult 实例，而这个实例里面会有一个 List<ApiMessageAndVersion>，
+            // 该方法会对每一个 topic 生成一个 ApiMessageAndVersion 实例，然后放入列表中
+            // 而后续的 writeEvent 中就会对这些 ApiMessageAndVersion 进行处理
             () -> replicationControl.createTopics(request, describable));
     }
 

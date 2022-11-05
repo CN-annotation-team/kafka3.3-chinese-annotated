@@ -111,31 +111,48 @@ class BrokerServer(
   var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = null
 
   var logDirFailureChannel: LogDirFailureChannel = null
+  // 日志管理器
   var logManager: LogManager = null
 
   var tokenManager: DelegationTokenManager = null
 
   var dynamicConfigHandlers: Map[String, ConfigHandler] = null
 
+  /**
+   * 1. 副本管理器，{@link ReplicaManager} 会负责 replica 的创建删除，信息修改，主从切换，
+   * 2. 副本是分区在一个 broker 节点中的表现形式，replicaManager 可以认为它也是分区管理器，但他只会负责分区的创建删除
+   * (可以看到下面对于分区还有一个 {@link AlterPartitionManager}，这个不叫 PartitionManager 就是因为创建删除分区
+   * 不归它管理，它只负责修改)
+   */
   @volatile private[this] var _replicaManager: ReplicaManager = null
 
   var credentialProvider: CredentialProvider = null
   var tokenCache: DelegationTokenCache = null
 
+  // 消费者分组协调器
   @volatile var groupCoordinator: GroupCoordinator = null
 
+  // 事务协调器
   var transactionCoordinator: TransactionCoordinator = null
 
+  /** broker 角色和 controller 角色之间的连接，broker 方是客户端，这里其实就是管理一个 tcp 客户端连接 controller */
   var clientToControllerChannelManager: BrokerToControllerChannelManager = null
 
+  /** 请求重定向管理器，部分请求需要进行重定向，这个功能其实主要是服务 kraft 模式下，部分请求需要让 controller leader
+   * 节点来处理，然后 broker 会同步 controller leader 处理请求后生成的动作日志，根据日志的内容再通过 {@link BrokerMetadataListener}
+   * 做具体的处理 */
   var forwardingManager: ForwardingManager = null
 
+  // partition 修改管理器
   var alterPartitionManager: AlterPartitionManager = null
 
+  // topic 自动创建管理器
   var autoTopicCreationManager: AutoTopicCreationManager = null
 
+  // 线程池
   var kafkaScheduler: KafkaScheduler = null
 
+  // 当前 broker 节点保存的 kraft 相关的元数据信息缓存
   @volatile var metadataCache: KRaftMetadataCache = null
 
   var quotaManagers: QuotaFactory.QuotaManagers = null
@@ -148,14 +165,20 @@ class BrokerServer(
 
   var metadataSnapshotter: Option[BrokerMetadataSnapshotter] = None
 
+  /** 集群元数据监听器，监听 __cluster-metadata topic 日志，该实例会被注册到 KafkaRaftClient 中，
+   * 当 kafkaRaftClient FETCH 到了新的日志会触发该监听器做对应的处理 */
   var metadataListener: BrokerMetadataListener = null
 
+  /** 集群元数据事件发布者，上面的监听器监听到有新的日志到来，会根据日志记录的动作，来更新 {@link org.apache.kafka.image.MetadataImage}
+   * 对应的部分，然后重新生成一个 metadata 镜像，这里的 metadataPublisher 则会将这个新的 image 进行解析
+   * 将具体的更改分发给对应的管理器去执行 */
   var metadataPublisher: BrokerMetadataPublisher = null
 
   val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault()
 
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
 
+  // 状态机改变
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
     try {
@@ -178,17 +201,20 @@ class BrokerServer(
   def replicaManager: ReplicaManager = _replicaManager
 
   override def startup(): Unit = {
+    // 从 SHUTDOWN 状态转换成 STARTING 状态
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
     try {
       info("Starting broker")
 
       config.dynamicConfig.initialize(zkClientOpt = None)
 
+      // 初始化 broker 的生命周期管理器
       lifecycleManager = new BrokerLifecycleManager(config,
         time,
         threadNamePrefix)
 
       /* start scheduler */
+      /* 根据配置指定的 background.threads 来创建一个线程池 */
       kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
       kafkaScheduler.startup()
 
@@ -203,6 +229,7 @@ class BrokerServer(
 
       // Create log manager, but don't start it because we need to delay any potential unclean shutdown log recovery
       // until we catch up on the metadata log and have up-to-date topic and broker configs.
+      // 创建日志管理器，但是不会立即启动该日志管理器，需要等待上一次关闭时的日志信息恢复
       logManager = LogManager(config, initialOfflineDirs, metadataCache, kafkaScheduler, time,
         brokerTopicStats, logDirFailureChannel, keepPartitionMetadataFile = true)
 
@@ -214,6 +241,7 @@ class BrokerServer(
       val controllerNodes = RaftConfig.voterConnectionsToNodes(controllerQuorumVotersFuture.get()).asScala
       val controllerNodeProvider = RaftControllerNodeProvider(raftManager, config, controllerNodes)
 
+      // 管理当前 broker 和 集群 Controller 之间的连接
       clientToControllerChannelManager = BrokerToControllerChannelManager(
         controllerNodeProvider,
         time,
@@ -224,6 +252,7 @@ class BrokerServer(
         retryTimeoutMs = 60000
       )
       clientToControllerChannelManager.start()
+      // 实例化重定向管理器
       forwardingManager = new ForwardingManagerImpl(clientToControllerChannelManager)
 
 
@@ -238,10 +267,12 @@ class BrokerServer(
       // Create and start the socket server acceptor threads so that the bound port is known.
       // Delay starting processors until the end of the initialization sequence to ensure
       // that credentials have been loaded before processing authentications.
+      // 创建 socketServer
       socketServer = new SocketServer(config, metrics, time, credentialProvider, apiVersionManager)
 
       clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)
 
+      // partition 更新管理器
       alterPartitionManager = AlterPartitionManager(
         config,
         metadataCache,
@@ -254,6 +285,7 @@ class BrokerServer(
       )
       alterPartitionManager.start()
 
+      // 副本管理器
       this._replicaManager = new ReplicaManager(
         config = config,
         metrics = metrics,
@@ -278,6 +310,7 @@ class BrokerServer(
 
       // Create group coordinator, but don't start it until we've started replica manager.
       // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+      // 消费者组协调器
       groupCoordinator = GroupCoordinator(config, replicaManager, Time.SYSTEM, metrics)
 
       val producerIdManagerSupplier = () => ProducerIdManager.rpc(
@@ -289,10 +322,12 @@ class BrokerServer(
 
       // Create transaction coordinator, but don't start it until we've started replica manager.
       // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+      // 事务协调器
       transactionCoordinator = TransactionCoordinator(config, replicaManager,
         new KafkaScheduler(threads = 1, threadNamePrefix = "transaction-log-manager-"),
         producerIdManagerSupplier, metrics, metadataCache, Time.SYSTEM)
 
+      // 自动创建 topic 管理器
       autoTopicCreationManager = new DefaultAutoTopicCreationManager(
         config, Some(clientToControllerChannelManager), None, None,
         groupCoordinator, transactionCoordinator)
@@ -398,7 +433,9 @@ class BrokerServer(
           KafkaServer.MIN_INCREMENTAL_FETCH_SESSION_EVICTION_MS))
 
       // Create the request processor objects.
+      // 创建 raft 元数据管理器
       val raftSupport = RaftSupport(forwardingManager, metadataCache)
+      // broker 角色开放的 apis
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         metadataSupport = raftSupport,
@@ -420,6 +457,7 @@ class BrokerServer(
         tokenManager = tokenManager,
         apiVersionManager = apiVersionManager)
 
+      // 请求处理线程池
       dataPlaneRequestHandlerPool = new KafkaRequestHandlerPool(config.nodeId,
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
         config.numIoThreads, s"${DataPlaneAcceptor.MetricPrefix}RequestHandlerAvgIdlePercent",

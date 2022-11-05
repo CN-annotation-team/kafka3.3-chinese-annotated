@@ -78,9 +78,12 @@ public class QuorumState {
     private final OptionalInt localId;
     private final Time time;
     private final Logger log;
+    // quorum 状态信息在内存和磁盘之间转换的工具类
     private final QuorumStateStore store;
+    // 当前配置文件中 controller.quorum.voters 配置的投票者集合
     private final Set<Integer> voters;
     private final Random random;
+    // 选举超时时间，默认是 1000ms，该字段会用来节点发起投票的时间
     private final int electionTimeoutMs;
     private final int fetchTimeoutMs;
     private final LogContext logContext;
@@ -113,7 +116,10 @@ public class QuorumState {
 
         ElectionState election;
         try {
+            /** 读取本地的存储的选举状态，具体文件的内容格式可以看 {@link FileBasedStateStore} */
             election = store.readElectionState();
+            // 如果本地有存储选举状态，即之前已经选举过，但是节点挂掉了，直接基于上一次存储状态开始选举
+            // 如果是第一次选举，设置纪元为 0，与所有参数投票的角色生成一个 ElectionState 实例
             if (election == null) {
                 election = ElectionState.withUnknownLeader(0, voters);
             }
@@ -127,12 +133,14 @@ public class QuorumState {
         }
 
         final EpochState initialState;
+        // 当前配置文件设置的的投票者和之前的投票者不吻合，报错
         if (!election.voters().isEmpty() && !voters.equals(election.voters())) {
             throw new IllegalStateException("Configured voter set: " + voters
                 + " is different from the voter set read from the state file: " + election.voters()
                 + ". Check if the quorum configuration is up to date, "
                 + "or wipe out the local state file if necessary");
         } else if (election.hasVoted() && !isVoter()) {
+            // 如果之前的配置的投票 ID 存在，但是当前节点不在投票者集合中，报错
             String localIdDescription = localId.isPresent() ?
                 localId.getAsInt() + " is not a voter" :
                 "is undefined";
@@ -143,11 +151,15 @@ public class QuorumState {
             log.warn("Epoch from quorum-state file is {}, which is " +
                 "smaller than last written epoch {} in the log",
                 election.epoch, logEndOffsetAndEpoch.epoch);
+            // 如果之前保留的选举纪元 < 当前纪元，则初始化状态为未连接状态，可以看做该角色挂掉了，在集群运行一段时间后，该节点有上线了
             initialState = new UnattachedState(
                 time,
+                // 纪元设置为当前纪元
                 logEndOffsetAndEpoch.epoch,
                 voters,
+                // 由于掉线了一段时间，所以不知道高水标是多少
                 Optional.empty(),
+                // 生成随机选举超时时间
                 randomElectionTimeoutMs(),
                 logContext
             );
@@ -158,6 +170,7 @@ public class QuorumState {
             // 2. It protects the invariant that each record is uniquely identified by
             //    offset and epoch, which might otherwise be violated if unflushed data
             //    is lost after restarting.
+            // 如果之前是 leader 节点，且到这里已经排除了纪元落后的情况，将初始化状态设置为辞职状态
             initialState = new ResignedState(
                 time,
                 localId.getAsInt(),
@@ -168,6 +181,7 @@ public class QuorumState {
                 logContext
             );
         } else if (localId.isPresent() && election.isVotedCandidate(localId.getAsInt())) {
+            // 如果当前节点投票的节点 ID 就是当前节点，那么当前节点初始状态为获选人状态
             initialState = new CandidateState(
                 time,
                 localId.getAsInt(),
@@ -179,6 +193,7 @@ public class QuorumState {
                 logContext
             );
         } else if (election.hasVoted()) {
+            // 如果当前节点已经投了票，则初始状态为 已投票状态
             initialState = new VotedState(
                 time,
                 election.epoch,
@@ -189,6 +204,8 @@ public class QuorumState {
                 logContext
             );
         } else if (election.hasLeader()) {
+            // 如果之前的 quorum 信息有 leader id，则当前节点的状态为 follower
+            // 上面已经判断过 leader id 为 当前节点的情况了
             initialState = new FollowerState(
                 time,
                 election.epoch,
@@ -199,6 +216,7 @@ public class QuorumState {
                 logContext
             );
         } else {
+            // 其他的情况都认为是离线状态
             initialState = new UnattachedState(
                 time,
                 election.epoch,
@@ -209,6 +227,7 @@ public class QuorumState {
             );
         }
 
+        // 转换当前节点的初始状态
         transitionTo(initialState);
     }
 
@@ -257,6 +276,7 @@ public class QuorumState {
         return hasLeader() && leaderIdOrSentinel() != localIdOrSentinel();
     }
 
+    // 是否是投票者，就是判断当前节点 ID 存在，且存在配置文件配置的投票者集合中
     public boolean isVoter() {
         return localId.isPresent() && voters.contains(localId.getAsInt());
     }
@@ -403,6 +423,7 @@ public class QuorumState {
         ));
     }
 
+    // 转换成候选者节点
     public void transitionToCandidate() {
         if (isObserver()) {
             throw new IllegalStateException("Cannot transition to Candidate since the local broker.id=" + localId +
@@ -413,7 +434,9 @@ public class QuorumState {
         }
 
         int retries = isCandidate() ? candidateStateOrThrow().retries() + 1 : 1;
+        // 纪元 + 1
         int newEpoch = epoch() + 1;
+        // 获取随机超时时间
         int electionTimeoutMs = randomElectionTimeoutMs();
 
         transitionTo(new CandidateState(
@@ -479,6 +502,11 @@ public class QuorumState {
         log.info("Completed transition to {}", state);
     }
 
+    /**
+     * raft 算法要求各个节点有不同的发起选举投票的时间，为了快速选出 leader 节点
+     * 随机一个选举超时时间介于 electionTimeoutMs - 2 * electionTimeoutMs 之间
+     * @return
+     */
     private int randomElectionTimeoutMs() {
         if (electionTimeoutMs == 0)
             return 0;

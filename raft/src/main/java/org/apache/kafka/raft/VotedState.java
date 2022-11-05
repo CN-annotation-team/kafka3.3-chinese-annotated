@@ -32,10 +32,15 @@ import java.util.Set;
  * then the voter will become a candidate.
  */
 public class VotedState implements EpochState {
+    // 当前角色投票的纪元
     private final int epoch;
+    // 给哪个节点 ID 投票
     private final int votedId;
+    // 投票者集合
     private final Set<Integer> voters;
+    // 选举超时时间
     private final int electionTimeoutMs;
+    // 选举定时器
     private final Timer electionTimer;
     private final Optional<LogOffsetMetadata> highWatermark;
     private final Logger log;

@@ -40,15 +40,20 @@ import java.util.concurrent.atomic.AtomicInteger;
  * instance to enable slicing a range of the log records.
  */
 public class FileRecords extends AbstractRecords implements Closeable {
+    // 表示当前 records 是否为日志文件的分片
     private final boolean isSlice;
+    // start 和 end 表示分片的起始位置和结束位置
     private final int start;
     private final int end;
 
     private final Iterable<FileLogInputStream.FileChannelRecordBatch> batches;
 
     // mutable state
+    // 大小，单位是字节，可能有多个 Handler 线程并发同一个分区写入消息，使用原子类
     private final AtomicInteger size;
+    // 用于读写对应的日志文件
     private final FileChannel channel;
+    // 指向磁盘上对应的日志文件
     private volatile File file;
 
     /**
@@ -180,12 +185,15 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @param records The records to append
      * @return the number of bytes written to the underlying file
      */
+    /** 将一组消息追加到日志文件中 */
     public int append(MemoryRecords records) throws IOException {
         if (records.sizeInBytes() > Integer.MAX_VALUE - size.get())
             throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
                     " bytes is too large for segment with current file position at " + size.get());
 
+        // 写数据到 FileChannel 中，这里做了写磁盘操作
         int written = records.writeFullyTo(channel);
+        // 修改数据量大小
         size.getAndAdd(written);
         return written;
     }
@@ -193,6 +201,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
     /**
      * Commit all written data to the physical disk
      */
+    /** 调用 FileChannel 的 force 方法做刷盘操作 */
     public void flush() throws IOException {
         channel.force(true);
     }
