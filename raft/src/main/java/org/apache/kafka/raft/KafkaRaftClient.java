@@ -2192,6 +2192,7 @@ public class KafkaRaftClient<T> implements RaftClient<T> {
             // 处于 Candidate 状态下，会发送投票请求，并试图将自己转换成 leader 节点
             return pollCandidate(currentTimeMs);
         } else if (quorum.isFollower()) {
+            // follower 角色的处理逻辑
             return pollFollower(currentTimeMs);
         } else if (quorum.isVoted()) {
             return pollVoted(currentTimeMs);

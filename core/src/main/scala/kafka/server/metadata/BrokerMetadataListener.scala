@@ -36,6 +36,7 @@ object BrokerMetadataListener {
   val MetadataBatchSizes = "MetadataBatchSizes"
 }
 
+/** 集群元数据监听器，该监听器会被注册到 kafkaRaftClient 中 */
 class BrokerMetadataListener(
   val brokerId: Int,
   time: Time,
@@ -109,6 +110,7 @@ class BrokerMetadataListener(
   /**
    * The event queue which runs this listener.
    */
+  /** 事件队列，注意这个队列内置了事件处理器并且持有一个事件处理线程，相当于在使用这个队列的时候只需要向这个队列入队事件就行了 */
   val eventQueue = new KafkaEventQueue(time, logContext, threadNamePrefix.getOrElse(""))
 
   /**
@@ -119,8 +121,11 @@ class BrokerMetadataListener(
   /**
    * Handle new metadata records.
    */
-  override def handleCommit(reader: BatchReader[ApiMessageAndVersion]): Unit =
+  /** kafkaRaftClient 在发出 FETCH 请求后收到 controller leader 回复的响应有新的集群元数据日志传过来，则会触发该函数 */
+  override def handleCommit(reader: BatchReader[ApiMessageAndVersion]): Unit = {
+    // 向事件队里中追加一个 HandleCommitEvent，队列会自己调用该 HandleCommitEvent 的 run 方法
     eventQueue.append(new HandleCommitsEvent(reader))
+  }
 
   class HandleCommitsEvent(reader: BatchReader[ApiMessageAndVersion])
       extends EventQueue.FailureLoggingEvent(log) {
@@ -145,6 +150,7 @@ class BrokerMetadataListener(
         maybeStartSnapshot()
       }
 
+      // 对所有的发布者调用 publish 方法处理元数据改变需要处理的逻辑
       _publisher.foreach(publish)
     }
   }
@@ -326,6 +332,7 @@ class BrokerMetadataListener(
   private def publish(publisher: MetadataPublisher): Unit = {
     val delta = _delta
     try {
+      // 这里会根据本次监听到的元数据更新信息，重新生成一个完整的 metadataImage
       _image = _delta.apply()
     } catch {
       case t: Throwable =>
@@ -334,12 +341,16 @@ class BrokerMetadataListener(
         throw metadataLoadingFaultHandler.handleFault(s"Error applying metadata delta $delta", t)
     }
 
+    // 将 metadataImage 包装成 metadataDelta
     _delta = new MetadataDelta(_image)
     if (isDebugEnabled) {
       debug(s"Publishing new metadata delta $delta at offset ${_image.highestOffsetAndEpoch().offset}.")
     }
 
     // This publish call is done with its own try-catch and fault handler
+    /** 调用发布者的 publish 方法，上面只是更新了集群元数据，但是还没有更新具体功能，
+     * 这里就是将元数据更改的部分分发到对应具体功能进行具体的处理
+     * 定位到 {@link BrokerMetadataPublisher.publish()} 看 publisher 的处理逻辑 */
     publisher.publish(delta, _image)
 
     // Update the metrics since the publisher handled the lastest image

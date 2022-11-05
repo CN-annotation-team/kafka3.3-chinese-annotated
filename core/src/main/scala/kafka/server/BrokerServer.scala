@@ -118,7 +118,12 @@ class BrokerServer(
 
   var dynamicConfigHandlers: Map[String, ConfigHandler] = null
 
-  // 副本管理器
+  /**
+   * 1. 副本管理器，{@link ReplicaManager} 会负责 replica 的创建删除，信息修改，主从切换，
+   * 2. 副本是分区在一个 broker 节点中的表现形式，replicaManager 可以认为它也是分区管理器，但他只会负责分区的创建删除
+   * (可以看到下面对于分区还有一个 {@link AlterPartitionManager}，这个不叫 PartitionManager 就是因为创建删除分区
+   * 不归它管理，它只负责修改)
+   */
   @volatile private[this] var _replicaManager: ReplicaManager = null
 
   var credentialProvider: CredentialProvider = null
@@ -130,9 +135,12 @@ class BrokerServer(
   // 事务协调器
   var transactionCoordinator: TransactionCoordinator = null
 
-  // broker 角色和 controller 角色之间的连接，broker 方是客户端，这里其实就是管理一个 tcp 客户端连接 controller
+  /** broker 角色和 controller 角色之间的连接，broker 方是客户端，这里其实就是管理一个 tcp 客户端连接 controller */
   var clientToControllerChannelManager: BrokerToControllerChannelManager = null
 
+  /** 请求重定向管理器，部分请求需要进行重定向，这个功能其实主要是服务 kraft 模式下，部分请求需要让 controller leader
+   * 节点来处理，然后 broker 会同步 controller leader 处理请求后生成的动作日志，根据日志的内容再通过 {@link BrokerMetadataListener}
+   * 做具体的处理 */
   var forwardingManager: ForwardingManager = null
 
   // partition 修改管理器
@@ -157,8 +165,13 @@ class BrokerServer(
 
   var metadataSnapshotter: Option[BrokerMetadataSnapshotter] = None
 
+  /** 集群元数据监听器，监听 __cluster-metadata topic 日志，该实例会被注册到 KafkaRaftClient 中，
+   * 当 kafkaRaftClient FETCH 到了新的日志会触发该监听器做对应的处理 */
   var metadataListener: BrokerMetadataListener = null
 
+  /** 集群元数据事件发布者，上面的监听器监听到有新的日志到来，会根据日志记录的动作，来更新 {@link org.apache.kafka.image.MetadataImage}
+   * 对应的部分，然后重新生成一个 metadata 镜像，这里的 metadataPublisher 则会将这个新的 image 进行解析
+   * 将具体的更改分发给对应的管理器去执行 */
   var metadataPublisher: BrokerMetadataPublisher = null
 
   val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault()
@@ -239,6 +252,7 @@ class BrokerServer(
         retryTimeoutMs = 60000
       )
       clientToControllerChannelManager.start()
+      // 实例化重定向管理器
       forwardingManager = new ForwardingManagerImpl(clientToControllerChannelManager)
 
 
@@ -419,6 +433,7 @@ class BrokerServer(
           KafkaServer.MIN_INCREMENTAL_FETCH_SESSION_EVICTION_MS))
 
       // Create the request processor objects.
+      // 创建 raft 元数据管理器
       val raftSupport = RaftSupport(forwardingManager, metadataCache)
       // broker 角色开放的 apis
       dataPlaneRequestProcessor = new KafkaApis(

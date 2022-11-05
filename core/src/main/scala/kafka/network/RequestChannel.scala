@@ -120,6 +120,7 @@ object RequestChannel extends Logging {
       releaseBuffer()
     }
 
+    // 判断当前请求是否重定向请求，判断 envelope 是否存在，只有重定向请求才有该属性
     def isForwarded: Boolean = envelope.isDefined
 
     private def shouldReturnNotController(response: AbstractResponse): Boolean = {

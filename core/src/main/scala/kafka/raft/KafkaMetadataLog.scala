@@ -522,6 +522,7 @@ final class KafkaMetadataLog private (
 
 object MetadataLogConfig {
   def apply(config: AbstractConfig, maxBatchSizeInBytes: Int, maxFetchSizeInBytes: Int): MetadataLogConfig = {
+    // 创建元数据日志配置
     new MetadataLogConfig(
       config.getInt(KafkaConfig.MetadataLogSegmentBytesProp),
       config.getInt(KafkaConfig.MetadataLogSegmentMinBytesProp),

@@ -82,7 +82,9 @@ class ControllerApis(val requestChannel: RequestChannel,
       val handlerFuture: CompletableFuture[Unit] = request.header.apiKey match {
         case ApiKeys.FETCH => handleFetch(request)
         case ApiKeys.FETCH_SNAPSHOT => handleFetchSnapshot(request)
+        /** 创建 topic，可以看 {@link KafkaApis.handle()} 中 CREATE_TOPICS 部分的注释 */
         case ApiKeys.CREATE_TOPICS => handleCreateTopics(request)
+        /** 删除 topic */
         case ApiKeys.DELETE_TOPICS => handleDeleteTopics(request)
         case ApiKeys.API_VERSIONS => handleApiVersionsRequest(request)
         case ApiKeys.ALTER_CONFIGS => handleLegacyAlterConfigs(request)
@@ -98,10 +100,12 @@ class ControllerApis(val requestChannel: RequestChannel,
         case ApiKeys.INCREMENTAL_ALTER_CONFIGS => handleIncrementalAlterConfigs(request)
         case ApiKeys.ALTER_PARTITION_REASSIGNMENTS => handleAlterPartitionReassignments(request)
         case ApiKeys.LIST_PARTITION_REASSIGNMENTS => handleListPartitionReassignments(request)
+        // 处理 broker 重定向过来的请求
         case ApiKeys.ENVELOPE => handleEnvelopeRequest(request, requestLocal)
         case ApiKeys.SASL_HANDSHAKE => handleSaslHandshakeRequest(request)
         case ApiKeys.SASL_AUTHENTICATE => handleSaslAuthenticateRequest(request)
         case ApiKeys.ALLOCATE_PRODUCER_IDS => handleAllocateProducerIdsRequest(request)
+        // 创建 partition
         case ApiKeys.CREATE_PARTITIONS => handleCreatePartitions(request)
         case ApiKeys.DESCRIBE_ACLS => aclApis.handleDescribeAcls(request)
         case ApiKeys.CREATE_ACLS => aclApis.handleCreateAcls(request)
@@ -137,11 +141,13 @@ class ControllerApis(val requestChannel: RequestChannel,
     }
   }
 
+  // 处理重定向请求
   def handleEnvelopeRequest(request: RequestChannel.Request, requestLocal: RequestLocal): CompletableFuture[Unit] = {
     if (!authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
       requestHelper.sendErrorResponseMaybeThrottle(request, new ClusterAuthorizationException(
         s"Principal ${request.context.principal} does not have required CLUSTER_ACTION for envelope"))
     } else {
+      // 这里会解析重定向请求，将实际请求解析出来，再调用 handle 方法进行处理
       EnvelopeUtils.handleEnvelopeRequest(request, requestChannel.metrics, handle(_, requestLocal))
     }
     CompletableFuture.completedFuture[Unit](())
@@ -335,16 +341,21 @@ class ControllerApis(val requestChannel: RequestChannel,
     }
   }
 
+  /** Controller Leader 节点处理创建 topic 的逻辑，controller leader 节点只会为这个 create topic 的动作生成一条日志记录 */
   def handleCreateTopics(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    // 获取请求体
     val createTopicsRequest = request.body[CreateTopicsRequest]
+    // 根据请求生成一个请求上下文，包括请求头，认证信息，超时时间。
     val context = new ControllerRequestContext(request.context.header.data, request.context.principal,
       requestTimeoutMsToDeadlineNs(time, createTopicsRequest.data.timeoutMs))
+    // 调用 createTopics
     val future = createTopics(context,
         createTopicsRequest.data,
         authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
         names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
         names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
             names, logIfDenied = false)(identity))
+    // 处理完 createTopics 的逻辑，会将响应回复给 Broker 节点
     future.handle[Unit] { (result, exception) =>
       requestHelper.sendResponseMaybeThrottle(request, throttleTimeMs => {
         if (exception != null) {
@@ -389,6 +400,7 @@ class ControllerApis(val requestChannel: RequestChannel,
         iterator.remove()
       }
     }
+    /** 这里会调用 {@link QuorumController.createTopics()} */
     controller.createTopics(context, effectiveRequest, describableTopicNames).thenApply { response =>
       duplicateTopicNames.forEach { name =>
         response.topics().add(new CreatableTopicResult().

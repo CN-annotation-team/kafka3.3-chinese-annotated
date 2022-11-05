@@ -29,6 +29,7 @@ import org.apache.kafka.common.requests.{AbstractRequest, AbstractResponse, Enve
 import scala.compat.java8.OptionConverters._
 
 trait ForwardingManager {
+  // 重定向请求
   def forwardRequest(
     originalRequest: RequestChannel.Request,
     responseCallback: Option[AbstractResponse] => Unit
@@ -114,9 +115,12 @@ class ForwardingManagerImpl(
     requestToString: () => String,
     responseCallback: Option[AbstractResponse] => Unit
   ): Unit = {
+    // 构建一个重定向请求
     val envelopeRequest = ForwardingManager.buildEnvelopeRequest(requestContext, requestBufferCopy)
 
+    // 定义重定向请求的响应处理器
     class ForwardingResponseHandler extends ControllerRequestCompletionHandler {
+      // 该方法主要是做响应的错误信息处理，最后会调用 responseCallback 回调函数处理响应
       override def onComplete(clientResponse: ClientResponse): Unit = {
 
         if (clientResponse.versionMismatch != null) {
@@ -149,6 +153,7 @@ class ForwardingManagerImpl(
             } else {
               parseResponse(envelopeResponse.responseData, requestBody, requestContext.header)
             }
+            // 调用 responseCallback 回调函数处理响应
             responseCallback(Option(response))
           }
         }
@@ -161,6 +166,9 @@ class ForwardingManagerImpl(
       }
     }
 
+    /** 这里调用 broker 角色到 Controller 角色的网络通信管理器，把请求发送给 Controller，
+     * 到这里可以直接定位 {@link ControllerApis.handle()} 方法中 ApiKeys 为 ENVELOPE 的部分
+     * 看 controller 节点的处理逻辑*/
     channelManager.sendRequest(envelopeRequest, new ForwardingResponseHandler)
   }
 

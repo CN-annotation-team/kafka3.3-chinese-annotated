@@ -24,19 +24,25 @@ import org.apache.kafka.common.TopicPartition
 
 import java.util.concurrent.atomic.AtomicReference
 
+/** 副本的状态信息 */
 case class ReplicaState(
   // The log start offset value, kept in all replicas; for local replica it is the
   // log's start offset, for remote replicas its value is only updated by follower fetch.
+  /** 所有副本都保存日志的开始偏移量，
+   * 如果是本地副本，就是当前最新的日志偏移量
+   * 如果是远程副本，只能通过 fetch 请求来更新 */
   logStartOffset: Long,
 
   // The log end offset value, kept in all replicas; for local replica it is the
   // log's end offset, for remote replicas its value is only updated by follower fetch.
+  /** leo 元数据记录日志结束偏移量 */
   logEndOffsetMetadata: LogOffsetMetadata,
 
   // The log end offset value at the time the leader received the last FetchRequest from this follower.
   // This is used to determine the lastCaughtUpTimeMs of the follower. It is reset by the leader
   // when a LeaderAndIsr request is received and might be reset when the leader appends a record
   // to its log.
+  /** 上一次 fetch 请求获取到的 leader 副本的 leo */
   lastFetchLeaderLogEndOffset: Long,
 
   // The time when the leader received the last FetchRequest from this follower.
@@ -58,16 +64,20 @@ case class ReplicaState(
    * offset of the leader OR when its last caught up time minus the current
    * time is smaller than the max replica lag.
    */
+  /** 判断副本日志是否追上了 leader 副本日志 */
   def isCaughtUp(
     leaderEndOffset: Long,
     currentTimeMs: Long,
     replicaMaxLagMs: Long
   ): Boolean = {
+    // leader 副本的 leo 等于该副本的 leo
+    // 或者 上一次追上 leader 的时间距离现在还没有超过副本的最大停滞时间
     leaderEndOffset == logEndOffset || currentTimeMs - lastCaughtUpTimeMs <= replicaMaxLagMs
   }
 }
 
 object ReplicaState {
+  // 定义一个空的副本状态
   val Empty: ReplicaState = ReplicaState(
     logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata,
     logStartOffset = UnifiedLog.UnknownOffset,
@@ -77,9 +87,15 @@ object ReplicaState {
   )
 }
 
+/**
+ * 副本
+ * @param brokerId   broker 节点 ID
+ * @param topicPartition   副本位于的 topic 分区
+ */
 class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Logging {
   private val replicaState = new AtomicReference[ReplicaState](ReplicaState.Empty)
 
+  // 每个副本都会有自己的日志状态
   def stateSnapshot: ReplicaState = replicaState.get
 
   /**
@@ -94,6 +110,7 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
    * fetch request is always smaller than the leader's LEO, which can happen if small produce requests are received at
    * high frequency.
    */
+  /** 进行一次 fetch 请求之后更新副本状态 */
   def updateFetchState(
     followerFetchOffsetMetadata: LogOffsetMetadata,
     followerStartOffset: Long,
@@ -101,11 +118,16 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
     leaderEndOffset: Long
   ): Unit = {
     replicaState.updateAndGet { currentReplicaState =>
+      // 如果本次 fetch 请求获取到的消息偏移量 大于 leader 的 leo
+      // 将 lastCaughtUpTime 更改为本次 fetch 请求的时间
       val lastCaughtUpTime = if (followerFetchOffsetMetadata.messageOffset >= leaderEndOffset) {
         math.max(currentReplicaState.lastCaughtUpTimeMs, followerFetchTimeMs)
       } else if (followerFetchOffsetMetadata.messageOffset >= currentReplicaState.lastFetchLeaderLogEndOffset) {
+        // 如果本次 fetch 到的日志偏移量没有超过 leader 的 leo，但是超过了上一次 fetch 到的 leader leo
+        // 将 lastCaughtUpTime 更改为上一次 fetch 时间
         math.max(currentReplicaState.lastCaughtUpTimeMs, currentReplicaState.lastFetchTimeMs)
       } else {
+        // 如果没有符合前面两个请求，lastCaughtUpTime 不变
         currentReplicaState.lastCaughtUpTimeMs
       }
 
@@ -123,6 +145,7 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
    * When the leader is elected or re-elected, the state of the follower is reinitialized
    * accordingly.
    */
+  /** 如果 leader 节点被选择出来，或者 leader 节点要被重新选择，重置副本状态 */
   def resetReplicaState(
     currentTimeMs: Long,
     leaderEndOffset: Long,
@@ -136,7 +159,9 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
       // a follower which is not in the ISR anymore.
       val lastCaughtUpTimeMs = if (isFollowerInSync) currentTimeMs else 0L
 
+      // 当前副本是新的 leader 副本
       if (isNewLeader) {
+        // 将副本信息置空
         ReplicaState(
           logStartOffset = UnifiedLog.UnknownOffset,
           logEndOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata,
@@ -145,6 +170,7 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
           lastCaughtUpTimeMs = lastCaughtUpTimeMs
         )
       } else {
+        // 如果当前副本之前是 leader 副本，现在不是了的情况
         ReplicaState(
           logStartOffset = currentReplicaState.logStartOffset,
           logEndOffsetMetadata = currentReplicaState.logEndOffsetMetadata,

@@ -143,7 +143,7 @@ class KafkaRaftManager[T](
   private val netChannel = buildNetworkChannel()
   private val expirationTimer = new SystemTimer("raft-expiration-executor")
   private val expirationService = new TimingWheelExpirationService(expirationTimer)
-  // 创建一个 kraft 客户端
+  // 创建一个 kraft 客户端，每个节点都会实例化一个 raft 客户端，这个 raft 客户端会管理当前节点的状态（包括节点的 topic partition replica 信息）
   override val client: KafkaRaftClient[T] = buildRaftClient()
   // raft 网络 IO 线程持有 raft 客户端，这个线程是 TCP 客户端，服务于 raft 客户端
   private val raftIoThread = new RaftIoThread(client, threadNamePrefix)
